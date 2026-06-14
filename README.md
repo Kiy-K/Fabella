@@ -130,7 +130,7 @@ Three claimed, three skipped. Fabella's honest inventory:
 | Badge | Status | Why |
 |---|---|---|
 | **Off-Brand** 🎨 | Claimed | Custom HTML+CSS+JS frontend served by `gradio.Server` — zero default Gradio chrome. |
-| **Sharing is Caring** 📡 | Claimed | Anonymized ReAct traces published to [`Kiy-K/fabella-traces`](https://huggingface.co/datasets/Kiy-K/fabella-traces). See `trace.py` for the schema and anonymization rules. |
+| **Sharing is Caring** 📡 | Re-scoped | For this demo, the public dataset was removed by the maker. Parents pull their own data at any time via the **Download my history** button in the settings dialog (calls `GET /api/history/download` and returns a JSON bundle of their chat + memory + a `trace_publication` statement). The `trace.py` publisher and `Kiy-K/fabella-traces` schema are still in the repo for re-deployment (set `FABELLA_SHARE_TRACES=1` to resume Hub publish). |
 | **Field Notes** 📓 | Claimed | Blog/report on what was built and learned, by the maker. |
 | **Off the Grid** 🔌 | Skipped | Drafter, judge, and TTS all run on Modal — a cloud GPU platform, not "in front of you." |
 | **Well-Tuned** 🎯 | Skipped | No fine-tuning; Gemma 4 E4B-IT and Nemotron Nano 4B are used stock, no PEFT/LoRA, no published checkpoint on the Hub. |
@@ -148,20 +148,36 @@ The hackathon's Off-Brand badge points at `gr.Server`. Fabella uses it. Concrete
 
 In other words: the canvas is `gradio.Server`'s FastAPI subclass, but the page is a hand-rolled SPA on top of it. Judges can verify by opening the Space, then running `grep -nE "gr\.Blocks|gr\.ChatInterface|gr\.Tabs" app.py` in the Space repo — empty result.
 
-## Agent trace dataset
+## Agent trace data: parent self-export
 
-Every Fabella generation that opts in (the default) appends an anonymized row to [`Kiy-K/fabella-traces`](https://huggingface.co/datasets/Kiy-K/fabella-traces). One JSONL row per request, capturing the full ReAct loop:
+For this demo, the public dataset was removed by the maker. Parents pull their own data at any time via the **Settings → Download my history** button in the running Space, which calls `GET /api/history/download` and returns a JSON bundle:
 
-- `agent.system_prompt` — the drafter prompt (static, in-repo)
-- `agent.user_prompt` — the built user message, with the raw situation text replaced by `<redacted>`
-- `agent.messages` — assistant tool calls + tool responses for `validate_explanation`
-- `agent.final_draft` — opener / body / closer / followup
-- `judge` — the Nemotron verdict (`ok`, `issues`, `score`, `verdict`, `reasoning`)
-- `request` — `age`, `tone`, `situation_hash` (sha256, for dedup), `situation_preview` (60-char truncated topic), `situation_length`, `history_turns`
+```json
+{
+  "schema": "fabella.history-bundle.v1",
+  "exported_at": "2026-06-14T...",
+  "owner_key": "anon:abcd1234...",
+  "session_id": "abcd1234...",
+  "signed_in": false,
+  "profile": {"child_name": "Mira", "child_age": 7, "preferred_tone": "gentle"},
+  "messages": [{"role": "parent", "content": "...", "age": 7, "tone": "gentle", "created_at": "..."}, ...],
+  "memory": {"facts": [...], "summary": "...", "threads": [...], "history_turns": 4},
+  "trace_publication": {
+    "dataset": "Kiy-K/fabella-traces",
+    "url": "https://huggingface.co/datasets/Kiy-K/fabella-traces",
+    "this_session_max_published_rows": 3,
+    "this_session_max_turns": 4,
+    "anonymization": [
+      "Child name is dropped from the request and replaced with [name] in the draft.",
+      "Raw situation text is never stored; only its SHA-256 hash, the first 60 chars, and its length are kept.",
+      "Freeform history turns are replaced with role + length counts in the published row.",
+      "The drafter's static system prompt is shipped in full (it's a public string in this repo)."
+    ]
+  }
+}
+```
 
-**Anonymization** (in order, all applied before the row ever leaves the Space): the raw situation is never written — only its hash, a 60-char topic prefix, and its length. The child's name is dropped from the request and redacted in the draft. The drafter's system prompt ships in full because it's a static string from this repo, not user input.
-
-**Capture is on by default.** Set `FABELLA_SHARE_TRACES=0` on the Space to kill the publisher, or pass `share_trace=False` on `make_explanation` to opt out per-request.
+**Re-deploying the public dataset:** the `trace.py` publisher and the `Kiy-K/fabella-traces` schema are still in the repo. Set `FABELLA_SHARE_TRACES=1` on the Space to resume writing rows to that dataset. With the env var unset (or `0`), the publisher is a no-op and rows only live in the per-parent bucket.
 
 ---
 

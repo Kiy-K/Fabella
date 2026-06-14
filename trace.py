@@ -88,9 +88,13 @@ FLUSH_INTERVAL_S = float(os.environ.get("FABELLA_TRACE_FLUSH_INTERVAL_S", "300")
 # make the dataset card's preview useful.
 DATASET_FILE = "data/train-00000-of-00001.jsonl"
 
-# Capture is on by default; off in local dev (set explicitly to "1" in prod
-# env). HF Spaces injects HF_TOKEN automatically for the owning user.
-SHARE_TRACES = os.environ.get("FABELLA_SHARE_TRACES", "1").lower() in (
+# Capture is OFF by default for the hackathon demo. The dataset was
+# removed by the maker; the only path to data now is the per-parent
+# "Download my history" self-export button (see ``app.py::
+# api_history_download``). To re-enable the public dataset for
+# re-deployment, set ``FABELLA_SHARE_TRACES=1`` on the Space and the
+# publisher will resume writing to ``Kiy-K/fabella-traces``.
+SHARE_TRACES = os.environ.get("FABELLA_SHARE_TRACES", "0").lower() in (
     "1",
     "true",
     "yes",

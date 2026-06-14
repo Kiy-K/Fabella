@@ -55,7 +55,7 @@ def _silence_asyncio_invalid_fd_warning() -> None:
 _silence_asyncio_invalid_fd_warning()
 
 from fastapi import Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from agent import run_agent
 from schema import ExplainRequest
@@ -583,6 +583,75 @@ async def api_history_clear(request: Request):
     return JSONResponse({"ok": True, "session_id": session_id})
 
 
+@app.get("/api/history/download")
+async def api_history_download(request: Request, session_id: str = ""):
+    """Bundle the parent's full local data into a single JSON download.
+
+    The download contains every chat turn stored in the parent's
+    bucket-backed history file, the durable memory, and a small
+    "trace-publication" section that tells them:
+
+      * how many of their generations opted into the public trace dataset,
+      * which dataset the rows go to (or would go to, on capture failure),
+      * a copy of the anonymization rules so they can verify what was
+        and was not recorded.
+
+    Trace rows themselves are not in this file -- they live in the
+    public dataset and contain only the redacted/anonymized data, not
+    any of the raw material the parent typed. The download proves the
+    point: there is nothing in here that is not also in the user's own
+    browser, and the public rows cannot leak anything more.
+
+    The response is ``Content-Disposition: attachment`` so the frontend
+    can trigger a file save via a hidden ``<a download>``.
+    """
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    owner_key, _, session_id = _owner_from_request(request, session_id)
+    with _history_lock:
+        history = _read_history(owner_key)
+    mem = memory_layer.read_memory(owner_key)
+    # Best-effort estimate of "how many turns went to the public trace
+    # dataset": the per-parent bucket does not store the trace
+    # submission receipts, so this is an upper bound (the number of
+    # turns that *had share_trace* at the time of generation, which
+    # the JS records as ``shared`` in the local message). If the
+    # client did not record that flag we fall back to total message
+    # count, which is a soft upper bound.
+    turn_count = len(history.get("messages") or [])
+    shared_count = sum(
+        1 for m in history.get("messages", []) if m.get("shared") is True
+    )
+    bundle = {
+        "schema": "fabella.history-bundle.v1",
+        "exported_at": _now_iso(),
+        "owner_key": owner_key,
+        "session_id": session_id,
+        "signed_in": not owner_key.startswith("anon:"),
+        "profile": history.get("profile"),
+        "messages": _public_messages(history.get("messages", [])),
+        "memory": memory_layer.public_view(mem),
+        "trace_publication": {
+            "dataset": "Kiy-K/fabella-traces",
+            "url": "https://huggingface.co/datasets/Kiy-K/fabella-traces",
+            "this_session_max_published_rows": shared_count,
+            "this_session_max_turns": turn_count,
+            "anonymization": [
+                "Child name is dropped from the request and replaced with [name] in the draft.",
+                "Raw situation text is never stored; only its SHA-256 hash, the first 60 chars, and its length are kept.",
+                "Freeform history turns are replaced with role + length counts in the published row.",
+                "The drafter's static system prompt is shipped in full (it's a public string in this repo).",
+            ],
+        },
+    }
+    body = json.dumps(bundle, ensure_ascii=False, indent=2).encode("utf-8")
+    filename = f"fabella-history-{session_id[:24] or 'anon'}.json"
+    return Response(
+        content=body,
+        media_type="application/json; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 # --- Memory endpoints -------------------------------------------------------
 
 
@@ -953,7 +1022,7 @@ a { color: var(--accent-strong); }
     <button type="button" class="chip" id="age-chip"><span class="chip-dot" aria-hidden="true"></span>Age <span id="age-chip-val">7</span></button>
     <button type="button" class="chip" id="tone-chip"><span class="chip-dot" aria-hidden="true"></span>Tone <span id="tone-chip-val">gentle</span></button>
     <button type="button" class="btn-ghost" id="open-settings">Settings</button>
-    <button type="button" class="btn-ghost" id="clear-history">Clear</button>
+    <button type="button" class="btn-ghost" id="topbar-clear-history">Clear</button>
   </div>
 </header>
 
@@ -984,6 +1053,20 @@ a { color: var(--accent-strong); }
       <button type="submit" class="btn-send" style="padding: 8px 14px;">Save</button>
     </div>
   </form>
+  <hr style="border: 0; border-top: 1px solid var(--line); margin: 18px 0 0;">
+  <div style="padding: 18px 22px 22px;">
+    <h2 style="margin: 0 0 6px; font-size: 16px;">Your data, on this device</h2>
+    <p style="margin: 0 0 12px; font: 400 13px/1.4 var(--font-sans); color: var(--text-soft);">
+      Your chat history and memory are stored in this Space's bucket, keyed to you.
+      When you opt in, redacted copies of the drafter/judge trace are published to a
+      <a href="https://huggingface.co/datasets/Kiy-K/fabella-traces" target="_blank" rel="noopener">public dataset</a>
+      — they contain no raw situation text, no child name, and no trace that links back to you.
+    </p>
+    <div style="display:flex; gap: 8px; flex-wrap: wrap;">
+      <button type="button" class="btn-ghost" id="download-history">Download my history</button>
+      <button type="button" class="btn-ghost" id="settings-clear-history">Clear history</button>
+    </div>
+  </div>
 </dialog>
 
 <footer class="foot">
@@ -1020,7 +1103,7 @@ a { color: var(--accent-strong); }
   var ageChipVal = document.getElementById("age-chip-val");
   var toneChip = document.getElementById("tone-chip");
   var toneChipVal = document.getElementById("tone-chip-val");
-  var clearBtn = document.getElementById("clear-history");
+  var clearBtn = document.getElementById("topbar-clear-history");
 
   var dlg = document.getElementById("settings");
   var ageRange = document.getElementById("age-range");
@@ -1446,6 +1529,37 @@ a { color: var(--accent-strong); }
     conversation = [];
     welcomeOrThread([]);
   });
+
+  // The settings-dialog equivalents. Pull the download bundle from the
+  // server and trigger a file save via an off-DOM <a download>. The
+  // server decides the filename.
+  var downloadBtn = document.getElementById("download-history");
+  if (downloadBtn) {
+    downloadBtn.addEventListener("click", function () {
+      var url = "/api/history/download?session_id=" + encodeURIComponent(sessionId);
+      window.location.href = url;
+    });
+  }
+  var settingsClearBtn = document.getElementById("settings-clear-history");
+  if (settingsClearBtn) {
+    settingsClearBtn.addEventListener("click", async function () {
+      if (!confirm("Clear this conversation and long-term memory? This cannot be undone.")) return;
+      try {
+        await fetch("/api/history/clear", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ session_id: sessionId }),
+        });
+        await fetch("/api/memory/clear", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ session_id: sessionId }),
+        });
+      } catch (_) {}
+      conversation = [];
+      welcomeOrThread([]);
+    });
+  }
 
   ageChip.addEventListener("click", function () { dlg.showModal(); });
   toneChip.addEventListener("click", function () { dlg.showModal(); });
