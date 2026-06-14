@@ -29,6 +29,8 @@ tags:
 
 [Live demo](https://build-small-hackathon-fabella.hf.space) · [Public GitHub repo](https://github.com/Kiy-K/Fabella) · [HF Space repo](https://huggingface.co/spaces/build-small-hackathon/Fabella) · [Modal app](https://modal.com/apps/khoitruong071510/main/deployed/fabella)
 
+Source code: [`Kiy-K/Fabella`](https://github.com/Kiy-K/Fabella)
+
 ---
 
 ## The neighbor next door
@@ -72,7 +74,7 @@ All three models sit comfortably under the **32B cap** — Fabella uses **10B of
 
 ## Sponsor prize notes
 
-- **OpenAI / Codex** — Codex was used for early boilerplate and scaffolding, then again for final submission cleanup: README polish, small consistency checks, and packaging the repo for judges.
+- **OpenAI / Codex** — Codex was used as a coding assistant for early boilerplate and scaffolding. This sponsor-track note is about development assistance, not runtime inference: Fabella's model pipeline uses Gemma, Nemotron, and VoxCPM2.
 - **NVIDIA** — `nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16` is the second model in the pipeline and acts as the structured-output judge in `judge.py`.
 - **Modal** — Modal runs all three inference services: the Gemma drafter, the Nemotron judge, and the VoxCPM2 TTS service.
 - **OpenBMB** — `openbmb/VoxCPM2` powers the optional **Read aloud** feature.
@@ -83,7 +85,7 @@ All three models sit comfortably under the **32B cap** — Fabella uses **10B of
 
 - **HF Space (CPU)** — custom HTML + CSS + JS frontend served by `gradio.Server` (FastAPI subclass). Chat-style, parent-friendly UI: welcome screen with example situations, alternating parent / Fabella turns, per-turn Read-aloud button, no default Gradio chrome.
 - **HF OAuth** — enabled for personalization; unsigned users fall back to browser-local anonymous sessions.
-- **HF Bucket per-user JSON** — minimal chat history and parent preferences persist at `/data/fabella-data/user-<owner_key>.json` (signed-in users keyed by HF username, anonymous users keyed by a `localStorage` session id).
+- **HF Bucket per-user JSON** — minimal chat history and parent preferences persist at `/data/fabella-data/user-<owner_key>.json` (signed-in users keyed by HF username, anonymous users keyed by a `localStorage` session ID).
 - **Modal** — one app, three web servers:
   - **Drafter** (A10G) — vLLM with `--language-model-only --enable-auto-tool-choice --tool-call-parser gemma4`
   - **Judge** (A10G) — vLLM with no tool-calling flags (Nemotron's tool-call dialect isn't a vLLM built-in)
@@ -134,7 +136,7 @@ The hackathon's Off-Brand badge points at `gr.Server`. Fabella uses it. Concrete
 - **No `gr.Blocks`, `gr.ChatInterface`, `gr.Tabs`, `gr.Interface`, or `with gr.` anywhere in `app.py`.** All UI state, all event handlers, and all the styling are in `INDEX_HTML` and the JS that lives inside it.
 - The demo video shows the running Space: the parent types a situation, the custom chat UI streams the four sections, and the per-turn Read-aloud button speaks the result. None of that ships with default Gradio.
 
-In other words: the canvas is `gradio.Server`'s FastAPI subclass, but the page is a hand-rolled SPA on top of it. Judges can verify by opening the Space, then running `grep -nE "gr\\.Blocks|gr\\.ChatInterface|gr\\.Tabs" app.py` in the Space repo — empty result.
+In other words: the canvas is `gradio.Server`'s FastAPI subclass, but the page is a hand-rolled SPA on top of it. Judges can verify by opening the Space, then running `grep -nE "gr\.Blocks|gr\.ChatInterface|gr\.Tabs" app.py` in the Space repo — empty result.
 
 ## Agent trace dataset
 
