@@ -182,6 +182,37 @@ def _anonymize_request(req: dict) -> dict:
     }
 
 
+def _stringify_message_content(content: Any) -> str:
+    """Render a LangChain message ``content`` field as a plain string.
+
+    LangChain 1.x allows ``content`` to be ``str`` (the common case) or a
+    list of content blocks (e.g. ``[{"type": "text", "text": "..."}]``).
+    List values used to crash the trace publisher because we did
+    ``str(content)`` and then string-replaced on the resulting repr. Now
+    we extract just the text blocks, which is what a human reading the
+    dataset wants anyway.
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, dict):
+                txt = block.get("text")
+                if isinstance(txt, str):
+                    parts.append(txt)
+                else:
+                    parts.append(str(block))
+            elif isinstance(block, str):
+                parts.append(block)
+            else:
+                parts.append(str(block))
+        return "\n".join(parts)
+    return str(content)
+
+
 def _anonymize_messages(messages: list) -> list:
     """Convert LangChain messages into a public-safe, JSON-only shape.
 
@@ -192,9 +223,7 @@ def _anonymize_messages(messages: list) -> list:
     out: list[dict[str, Any]] = []
     for m in messages or []:
         kind = getattr(m, "type", "") or "unknown"
-        content = getattr(m, "content", "") or ""
-        if not isinstance(content, str):
-            content = str(content)
+        content = _stringify_message_content(getattr(m, "content", None))
         entry: dict[str, Any] = {
             "role": kind,
             "content": _scrub_name(content),
@@ -214,6 +243,46 @@ def _anonymize_messages(messages: list) -> list:
             entry["tool_call_id"] = tool_call_id
         out.append(entry)
     return out
+
+
+def _extract_judge_verdict(messages: list) -> dict | None:
+    """Pull the latest validate_explanation judge verdict from the message list.
+
+    ``agent.py`` runs ``validate_explanation`` as a tool. The tool returns a
+    JSON string with the Pydantic-validated verdict (see ``judge.py``); the
+    content of the matching ``ToolMessage`` is the source of truth. We
+    surface it on the trace row so the public dataset carries the
+    drafter-judge conversation end-to-end.
+
+    Note: LangChain 1.x ``ToolMessage`` does not populate ``name`` from the
+    tool's registered name, so we identify the verdict by its JSON shape
+    (presence of ``ok`` / ``verdict`` / ``issues``) rather than by ``name``.
+    """
+    last_verdict_msg = None
+    for m in messages or []:
+        if getattr(m, "type", "") != "tool":
+            continue
+        content = _stringify_message_content(getattr(m, "content", None)).strip()
+        if not content:
+            continue
+        try:
+            parsed = json.loads(content)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(parsed, dict) and (
+            "ok" in parsed or "verdict" in parsed or "issues" in parsed
+        ):
+            last_verdict_msg = m
+    if last_verdict_msg is None:
+        return None
+    content = _stringify_message_content(getattr(last_verdict_msg, "content", None)).strip()
+    try:
+        parsed = json.loads(content)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    return _anonymize_judge(parsed)
 
 
 def _anonymize_judge(verdict: dict | None) -> dict | None:
@@ -305,7 +374,11 @@ def build_trace_record(
             "messages": _anonymize_messages(messages),
             "final_draft": _anonymize_draft(final_draft),
         },
-        judge=_anonymize_judge(judge_verdict),
+        judge=(
+            _anonymize_judge(judge_verdict)
+            if judge_verdict is not None
+            else _extract_judge_verdict(messages)
+        ),
         latency_ms=int(latency_ms),
         tool_calls=tool_calls,
         app_version=app_version,
@@ -333,17 +406,39 @@ class TracePublisher:
         self._lock = threading.Lock()
         self._flush_lock = threading.Lock()
         self._last_flush = time.monotonic()
-        self._enabled = SHARE_TRACES and bool(os.environ.get("HF_TOKEN"))
+        # HF Spaces inject the token as HF_TOKEN. Some runtimes use HF_HUB_TOKEN
+        # instead; accept either so a misconfigured Space does not silently
+        # disable trace publishing.
+        self._hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HF_HUB_TOKEN") or ""
+        self._enabled = SHARE_TRACES and bool(self._hf_token)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        # How many rows we will buffer before refusing new submissions. Set
+        # high enough to ride out a transient Hub failure, low enough to
+        # avoid leaking memory if the Hub is permanently unreachable.
+        self._max_buffer = max(FLUSH_BUFFER_SIZE * 4, 50)
+        # Used to throttle repeated failure logs to one ERROR per N attempts.
+        self._consecutive_failures = 0
 
     @property
     def enabled(self) -> bool:
         return self._enabled
 
     def start(self) -> None:
+        if not SHARE_TRACES:
+            log.info("[traces] publishing disabled (FABELLA_SHARE_TRACES=0)")
+            return
+        if not self._hf_token:
+            # Loud at WARNING so the Space logs make the missing-token case
+            # obvious. The previous version's INFO-only line made it look
+            # like an intentional no-op.
+            log.warning(
+                "[traces] publishing DISABLED: HF_TOKEN (or HF_HUB_TOKEN) is "
+                "not set on this Space. Trace rows will be dropped on the floor. "
+                "Set HF_TOKEN to the Space owner's write token to enable capture."
+            )
+            return
         if not self._enabled:
-            log.info("[traces] publishing disabled (FABELLA_SHARE_TRACES=0 or HF_TOKEN missing)")
             return
         if self._thread is not None and self._thread.is_alive():
             return
@@ -354,17 +449,28 @@ class TracePublisher:
         self._thread.start()
         log.info(
             f"[traces] publisher started, repo={DATASET_REPO} "
-            f"flush_size={FLUSH_BUFFER_SIZE} flush_interval_s={FLUSH_INTERVAL_S}"
+            f"flush_size={FLUSH_BUFFER_SIZE} flush_interval_s={FLUSH_INTERVAL_S} "
+            f"max_buffer={self._max_buffer}"
         )
 
     def stop(self) -> None:
         self._stop.set()
 
     def submit(self, record: TraceRecord) -> None:
-        """Non-blocking. Drops the record if publishing is disabled."""
+        """Non-blocking. Drops the record if publishing is disabled or full."""
         if not self._enabled:
             return
         with self._lock:
+            if len(self._buffer) >= self._max_buffer:
+                # The Hub has been failing for a while and the buffer is
+                # full. Drop the oldest rows so a recovered Hub push only
+                # loses ancient data, not fresh rows.
+                dropped = len(self._buffer) - self._max_buffer + 1
+                del self._buffer[:dropped]
+                log.warning(
+                    f"[traces] buffer full ({self._max_buffer}); dropped "
+                    f"{dropped} oldest row(s) while Hub push is failing"
+                )
             self._buffer.append(record)
             should_flush = len(self._buffer) >= FLUSH_BUFFER_SIZE
         if should_flush:
@@ -396,21 +502,30 @@ class TracePublisher:
             try:
                 self._push_to_hub(rows)
                 self._last_flush = time.monotonic()
+                self._consecutive_failures = 0
                 log.info(f"[traces] flushed {len(rows)} rows to {DATASET_REPO}")
             except Exception as e:
+                self._consecutive_failures += 1
                 # Don't lose data on transient failures. Put the rows back
-                # at the head of the buffer so the next flush retries.
-                log.warning(
-                    f"[traces] push failed: {type(e).__name__}: {e}; "
-                    f"re-queuing {len(rows)} rows"
-                )
+                # at the head of the buffer so the next flush retries. Log
+                # at WARNING the first few times, then ERROR on every 10th
+                # so a stuck Hub does not spam the Space log.
                 with self._lock:
                     self._buffer = rows + self._buffer
+                if self._consecutive_failures <= 3 or self._consecutive_failures % 10 == 0:
+                    log.log(
+                        logging.ERROR if self._consecutive_failures > 3 else logging.WARNING,
+                        f"[traces] push failed "
+                        f"({self._consecutive_failures} consecutive): "
+                        f"{type(e).__name__}: {e}; re-queuing {len(rows)} rows. "
+                        f"Check that the Space's HF_TOKEN has write access to "
+                        f"'{DATASET_REPO}'.",
+                    )
 
     def _push_to_hub(self, rows: list[TraceRecord]) -> None:
         from huggingface_hub import HfApi
 
-        api = HfApi(token=os.environ.get("HF_TOKEN"))
+        api = HfApi(token=self._hf_token)
         new_lines = "\n".join(r.to_jsonl() for r in rows) + "\n"
 
         existing = ""
@@ -427,6 +542,9 @@ class TracePublisher:
                 if existing and not existing.endswith("\n"):
                     existing += "\n"
         except Exception:
+            # First push, missing file, or read-permission issue. Treating
+            # as empty lets the upload proceed so a write-protected read
+            # does not silently disable capture.
             existing = ""
 
         api.upload_file(

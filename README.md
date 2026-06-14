@@ -29,6 +29,12 @@ tags:
 
 [Live demo](https://build-small-hackathon-fabella.hf.space) · [Public GitHub repo](https://github.com/Kiy-K/Fabella) · [HF Space repo](https://huggingface.co/spaces/build-small-hackathon/Fabella) · [Modal app](https://modal.com/apps/khoitruong071510/main/deployed/fabella)
 
+## Demo video
+
+[Watch on YouTube](https://youtu.be/dAoy1GRbEV8)
+
+The 90-second walkthrough shows the parent flow (situation → age → tone → validated draft → read aloud), the 3-model pipeline (Gemma 4 E4B drafter · Nemotron 3 Nano judge · VoxCPM2 read-aloud), the HF Bucket memory layer, and the anonymized trace dataset. Narration is ElevenLabs (`eleven_multilingual_v2`, voice `Roger`); caption timings are derived from a Whisper `small.en` pass over the synthesized audio.
+
 Source code: [`Kiy-K/Fabella`](https://github.com/Kiy-K/Fabella)
 
 ---

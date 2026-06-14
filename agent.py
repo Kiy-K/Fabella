@@ -413,25 +413,18 @@ def _maybe_publish_trace(req, user_prompt, messages, parsed, started) -> None:
     try:
         from trace import build_trace_record, publisher
 
-        judge_verdict = None
-        for m in reversed(messages or []):
-            if getattr(m, "type", "") == "ai" and getattr(m, "tool_calls", None):
-                break
-        # The judge verdict is captured from the ToolMessage that came back
-        # from validate_explanation; it lives in the messages list already,
-        # so we don't re-invoke the judge here. The publisher's anonymizer
-        # will read it from the tool result if it parses cleanly. For now
-        # we leave judge=None and let the dataset row carry the final draft
-        # only — adding judge verdict re-parse would couple trace.py to
-        # judge.py's internals.
         latency_ms = int((time.monotonic() - started) * 1000)
+        # The judge verdict lives in the ``ToolMessage`` that came back
+        # from ``validate_explanation``; ``trace.py`` already knows how to
+        # extract and anonymize it, so we just pass the messages through
+        # and let the publisher do the work.
         record = build_trace_record(
             req=req,
             user_prompt=user_prompt,
             system_prompt=SYSTEM_PROMPT,
             messages=messages,
             final_draft=parsed,
-            judge_verdict=judge_verdict,
+            judge_verdict=None,  # trace.py extracts it from messages
             latency_ms=latency_ms,
         )
         publisher.submit(record)
