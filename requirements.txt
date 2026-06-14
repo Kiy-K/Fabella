@@ -1,5 +1,5 @@
 gradio>=4.0,<7.0
-spaces>=0.18.0
-transformers>=4.40.0
-torch>=2.0.0
-accelerate>=0.27.0
+langchain>=1.0
+langchain-core>=1.0
+langchain-openai>=0.3
+openai>=1.76

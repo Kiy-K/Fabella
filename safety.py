@@ -3,9 +3,8 @@
 import re
 
 MAX_NAME_LEN = 30
-MAX_THEMES = 3
-MAX_THEME_LEN = 20
-MAX_MORAL_LEN = 120
+MAX_SITUATION_LEN = 600     # a few sentences of context from the parent
+MAX_MORAL_LEN = 120          # kept for any lingering legacy call sites
 
 CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 PROFANITY = {
@@ -27,30 +26,13 @@ def sanitize_name(raw: str) -> str:
     return clean_text(raw, MAX_NAME_LEN)
 
 
-def sanitize_themes(raw) -> list[str]:
-    if not raw:
-        return []
-    if isinstance(raw, str):
-        items = [raw]
-    else:
-        items = list(raw)
-    out = []
-    seen = set()
-    for t in items:
-        t = clean_text(str(t), MAX_THEME_LEN)
-        if not t:
-            continue
-        key = t.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(t)
-        if len(out) >= MAX_THEMES:
-            break
-    return out
+def sanitize_situation(raw: str) -> str:
+    """The freeform situation the parent describes."""
+    return clean_text(raw, MAX_SITUATION_LEN)
 
 
 def sanitize_moral(raw: str) -> str:
+    """Kept for legacy call sites. No longer used in the new explainer."""
     return clean_text(raw, MAX_MORAL_LEN)
 
 
@@ -71,9 +53,26 @@ def age_bucket(age: int) -> str:
 
 
 def length_to_words(length: str) -> tuple[int, int]:
-    """Return (min_words, max_words) for a length label."""
+    """Return (min_words, max_words) for a length label.
+
+    Kept for legacy call sites. The new explainer uses its own
+    `explain_to_words()` mapping by tone.
+    """
     return {
         "short": (120, 220),
         "medium": (280, 420),
         "long": (500, 800),
     }.get(length, (280, 420))
+
+
+def explain_to_words(tone: str) -> tuple[int, int]:
+    """Target word count (min, max) for the explanation body, by tone.
+
+    Explanations are deliberately short — 60-160 words depending on
+    tone. Parents skim these before reading aloud; long is a bug.
+    """
+    return {
+        "gentle": (60, 110),
+        "matter-of-fact": (70, 130),
+        "playful": (50, 100),
+    }.get(tone, (60, 110))
