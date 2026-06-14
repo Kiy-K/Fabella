@@ -53,8 +53,9 @@ The product design has two distinct execution layers, each tuned to its job:
 - Drafter vLLM flags: `--language-model-only --enable-auto-tool-choice --tool-call-parser gemma4`.
 - Judge vLLM flags: none (the judge emits raw JSON in `content`; Pydantic parses).
 - TTS is separate from drafter/judge and only called from `make_audio` when the user clicks **Read aloud**.
-- Drafter and judge use `min_containers=1` while budget allows, so the critical-path LLMs stay warm for demos.
-- TTS also uses `min_containers=1` and runs on `L4` instead of A10G because VoxCPM2 is small enough for a cheaper/newer GPU class.
+- Drafter and judge use `min_containers=0` and `scaledown_window=2 * MINUTES` so containers fall to zero when idle. This keeps the GPU bill under control for the 3-day demo. The Space fires a background warmup ping to each endpoint on import, so the cold start happens while the parent is reading the welcome screen; the first real request then lands on a warm container.
+- TTS also uses `min_containers=0` (same policy) and runs on `L4` instead of A10G because VoxCPM2 is small enough for a cheaper/newer GPU class.
+- Drafter and judge vLLM flags also include `--enforce-eager` to skip CUDA-graph capture. This trades a small amount of steady-state throughput for a much faster first-token time after cold start, which is the right tradeoff for a demo where first-token latency matters more than tokens/sec.
 
 ## Live URLs
 

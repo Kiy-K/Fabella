@@ -125,6 +125,49 @@ except Exception as e:
     print(f"[traces] publisher failed to start: {type(e).__name__}: {e}", flush=True)
 
 
+def _warm_modal_endpoints() -> None:
+    """Best-effort warmup of the Modal drafter, judge, and TTS endpoints.
+
+    All three Modal containers are deployed with ``min_containers=0`` to
+    keep the GPU bill under control for the 3-day demo. The first real
+    request after a quiet period therefore pays a 60-120s cold start on
+    the LLM containers (image import + vLLM init + model load).
+
+    This routine pings each endpoint's ``/health`` route from a daemon
+    thread as soon as the Space boots, so the cold start happens in the
+    background while the parent reads the welcome screen. The first
+    real parent click then lands on a warm container. Failures are
+    silent; the warmup is a hint, not a requirement.
+    """
+
+    def _ping(url: str) -> None:
+        if not url:
+            return
+        try:
+            import urllib.request
+
+            with urllib.request.urlopen(f"{url.rstrip('/')}/health", timeout=300) as r:
+                r.read()
+        except Exception as e:
+            print(f"[warmup] {url} ping failed: {type(e).__name__}: {e}", flush=True)
+
+    import threading
+
+    def _all() -> None:
+        for label, url in (
+            ("drafter", MODAL_DRAFTER_URL),
+            ("judge", MODAL_JUDGE_URL),
+            ("tts", MODAL_TTS_URL),
+        ):
+            print(f"[warmup] pinging {label} at {url}", flush=True)
+            threading.Thread(target=_ping, args=(url,), daemon=True, name=f"warmup-{label}").start()
+
+    threading.Thread(target=_all, daemon=True, name="fabella-warmup").start()
+
+
+_warm_modal_endpoints()
+
+
 
 
 

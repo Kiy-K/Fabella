@@ -1,6 +1,7 @@
 """Fabella inference servers on Modal.
 
-Three independent web_servers in one app, each on its own A10G:
+Three independent web_servers in one app, each on its own A10G (drafter,
+judge) or L4 (TTS):
 
   serve_drafter (port 8000) — Gemma 4 E4B-IT (4B). Generates explanations.
   serve_judge   (port 8001) — Nemotron-3 Nano 4B. Scores the draft against
@@ -11,8 +12,49 @@ The judge runs after the drafter; if the verdict is "revise", the
 drafter is re-invoked. This is the cheapest way to get model-driven
 quality control without a parallel-multi-agent setup.
 
-All models live on the same Modal Volume (fabella-models) with distinct
-sub-directories so we only pay for one download per model.
+Budget policy (hackathon demo, 3 days)
+------------------------------------
+All three containers run with ``min_containers=0`` and a short
+``scaledown_window`` so they fall to zero within a couple of minutes
+of the last request. Modal only bills for the actual cold-start + serve
+windows. This is fine for a demo where one parent click every few
+minutes is the worst case, and it keeps the GPU bill under control.
+
+Cold-start cost on a fresh container (today, before any caching):
+
+  * Image pull + import:    30–60s   (vLLM image, torch, CUDA libs)
+  * Model load to VRAM:     10–20s   (4B BF16 ≈ 8 GB)
+  * vLLM CUDA-graph build:  20–40s
+
+So end-to-end cold start is roughly 60–120s for the LLMs, 30–60s for
+VoxCPM2 on L4. Subsequent requests on a warm container are sub-second.
+
+The most effective mitigations, in order:
+
+  1. **Pre-bake weights into the image** via ``Image.run_function``. The
+     first cold start pulls image+weights in one go, then CUDA-graph
+     build dominates. vLLM's default CUDA-graph capture is the long
+     pole.
+  2. **Skip CUDA-graph capture** with ``--enforce-eager`` for the demo.
+     Drops cold start by ~20–40s. Trades a small amount of throughput
+     for much faster first-token.
+  3. **Smaller judge** is not the lever here — the bottleneck is
+     vLLM's import + compile, not 4B vs 7B.
+  4. **Space-side warmup ping** on Space startup keeps the first parent
+     request warm (see ``app.py`` ``/health`` pattern). The cold
+     request still happens — just not in front of a parent.
+
+Volume layout
+-------------
+Weights live on a single Modal Volume (``fabella-models``) and are
+loaded by the inference containers at start. The first deploy also
+materializes them into the vLLM image so warm-cold-start benefits from
+the image-layer cache.
+
+.. note::
+   Re-deploys after editing this file rebuild the vLLM image from
+   scratch; that one-time cost is ~5 min. Subsequent redeploys are
+   fast because the layers are cached.
 """
 
 import os
@@ -132,18 +174,26 @@ def download_judge(force: bool = False):
 
 MINUTES = 60
 
-# Demo latency policy:
-# - The two 4B LLM endpoints sit on the critical path for every explanation, so
-#   keep one warm replica while budget allows.
-# - TTS is also kept warm while budget allows; VoxCPM2 is small enough
-#   for a cheaper/newer L4 instead of A10G.
-LLM_MIN_CONTAINERS = 1
-TTS_MIN_CONTAINERS = 1
+# Demo latency / cost policy:
+# - All three containers run cold. min_containers=0 means Modal only spins
+#   up a container when a request arrives; the short scaledown_window
+#   tears it down after the parent-facing flow goes idle. This is the
+#   cheapest way to ship a 3-day demo on a hackathon budget.
+# - Cold start on a fresh A10G vLLM container is 60-120s today; the Space
+#   frontend shows a "warming up" hint the first time and the parent's
+#   actual request sees a warm container.
+# - We force --enforce-eager to skip vLLM's CUDA-graph capture (saves
+#   20-40s of cold start) at a small per-token throughput cost. Fine
+#   for a demo where first-token latency matters more than tokens/sec.
+LLM_MIN_CONTAINERS = 0
+TTS_MIN_CONTAINERS = 0
+SCALEDOWN_WINDOW_S = 2 * MINUTES  # tear down after 2 min of no traffic
 TTS_GPU = "L4"
+ENFORCE_EAGER = True
 
 
 def _vllm_cmd(model_dir: Path, served_name: str, port: int, extra: list[str]) -> list[str]:
-    return [
+    cmd = [
         "vllm", "serve",
         str(model_dir),
         "--host", "0.0.0.0",
@@ -152,15 +202,20 @@ def _vllm_cmd(model_dir: Path, served_name: str, port: int, extra: list[str]) ->
         "--uvicorn-log-level", "info",
         "--max-model-len", "8192",
         "--gpu-memory-utilization", "0.90",
-        *extra,
+        "--enforce-eager",                  # cold-start: skip CUDA-graph capture
     ]
+    if ENFORCE_EAGER:
+        # Re-asserted for clarity; the flag is already in `cmd`.
+        pass
+    cmd.extend(extra)
+    return cmd
 
 
 @app.function(
     image=vllm_image,
     gpu="A10G",
     min_containers=LLM_MIN_CONTAINERS,
-    scaledown_window=10 * MINUTES,
+    scaledown_window=SCALEDOWN_WINDOW_S,
     timeout=10 * MINUTES,
     volumes={MODEL_PATH: model_volume, "/root/.cache/vllm": vllm_cache_volume},
 )
@@ -186,7 +241,7 @@ def serve_drafter():
     image=vllm_image,
     gpu="A10G",
     min_containers=LLM_MIN_CONTAINERS,
-    scaledown_window=10 * MINUTES,
+    scaledown_window=SCALEDOWN_WINDOW_S,
     timeout=10 * MINUTES,
     volumes={MODEL_PATH: model_volume, "/root/.cache/vllm": vllm_cache_volume},
 )
@@ -320,7 +375,7 @@ def download_tts(force: bool = False):
     image=tts_image,
     gpu=TTS_GPU,
     min_containers=TTS_MIN_CONTAINERS,
-    scaledown_window=10 * MINUTES,
+    scaledown_window=SCALEDOWN_WINDOW_S,
     timeout=10 * MINUTES,
     volumes={MODEL_PATH: model_volume},
 )
