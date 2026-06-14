@@ -29,25 +29,6 @@ tags:
 
 [Live demo](https://build-small-hackathon-fabella.hf.space) · [Public GitHub repo](https://github.com/Kiy-K/Fabella) · [HF Space repo](https://huggingface.co/spaces/build-small-hackathon/Fabella) · [Modal app](https://modal.com/apps/khoitruong071510/main/deployed/fabella)
 
-## Demo video
-
-[Watch on YouTube](https://youtu.be/dAoy1GRbEV8) · [Source composition](video/index.html) · [Rendered MP4](video/renders/fabella-demo-elevenlabs-final.mp4)
-
-The 90-second walkthrough shows the parent flow (situation → age → tone → validated draft → read aloud), the 3-model pipeline (Gemma 4 E4B drafter · Nemotron 3 Nano judge · VoxCPM2 read-aloud), the HF Bucket memory layer, and the anonymized trace dataset. Narration is ElevenLabs (`eleven_multilingual_v2`, voice `Roger`); caption timings are derived from a Whisper `small.en` pass over the synthesized audio.
-
-```
-video/
-├── index.html                          # HyperFrames composition (root timeline)
-├── fabella-demo/
-│   ├── narration.txt                   # 17-line script
-│   ├── narration.wav                   # ElevenLabs synth (89.21s, 44.1k mono)
-│   ├── recording-clips/                # UI recordings: welcome, flow, populated, readaloud
-│   └── capture/screenshots/            # still frames used as reference
-├── snapshots/                          # per-timestamp full-frame stills
-└── renders/
-    └── fabella-demo-elevenlabs-final.mp4   # 1920x1080 · 30fps · 89.52s
-```
-
 Source code: [`Kiy-K/Fabella`](https://github.com/Kiy-K/Fabella)
 
 ---
@@ -151,7 +132,6 @@ The hackathon's Off-Brand badge points at `gr.Server`. Fabella uses it. Concrete
 
 - **`app.py:97`** — `app = Server()` from `gradio`, not `gr.Blocks` or `gr.ChatInterface`. The Space has zero default Gradio chrome.
 - **`app.py:602`–`1453`** — `INDEX_HTML = r"""<!doctype html>..."""`, ~850 lines of hand-written HTML, CSS, and vanilla JS. Custom welcome screen, example-situation chips, alternating parent/Fabella chat bubbles, per-turn Read-aloud buttons, settings dialog, history pane.
-- The 90-second [demo video](https://youtu.be/dAoy1GRbEV8) walks the full parent flow on the running Space.
 - **`app.py:1454`** — `@app.get("/", response_class=HTMLResponse) def index(): return INDEX_HTML` — the only thing at `/` is the hand-coded page.
 - **No `gr.Blocks`, `gr.ChatInterface`, `gr.Tabs`, `gr.Interface`, or `with gr.` anywhere in `app.py`.** All UI state, all event handlers, and all the styling are in `INDEX_HTML` and the JS that lives inside it.
 - The demo video shows the running Space: the parent types a situation, the custom chat UI streams the four sections, and the per-turn Read-aloud button speaks the result. None of that ships with default Gradio.
@@ -216,5 +196,4 @@ Runtime notes:
 - **≤ 32B params** · both LLMs are 4B; total inference is 10B
 - **Gradio app** · hosted as an HF Space, custom UI served by `gradio.Server`
 - **No API key needed for the models** · all open weights on Modal credits
-- **Show, don't tell** · [demo video](https://youtu.be/dAoy1GRbEV8) + social post in submission
-
+- **Show, don't tell** · demo video + social post in submission
