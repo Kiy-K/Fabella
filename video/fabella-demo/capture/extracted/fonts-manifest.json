@@ -1,0 +1,107 @@
+{
+  "files": [
+    {
+      "file": "QGYyz_MVcBeNP4NjuGObqx1XmO1I4QK1C4E.ttf",
+      "family": "Outfit",
+      "rawFamily": "Outfit Medium",
+      "subfamily": "Regular",
+      "postscript": "Outfit-Medium",
+      "weight": 500,
+      "style": "normal",
+      "variationAxes": [],
+      "identified": true
+    },
+    {
+      "file": "QGYyz_MVcBeNP4NjuGObqx1XmO1I4TC1C4E.ttf",
+      "family": "Outfit",
+      "rawFamily": "Outfit",
+      "subfamily": "Regular",
+      "postscript": "Outfit-Regular",
+      "weight": 400,
+      "style": "normal",
+      "variationAxes": [],
+      "identified": true
+    },
+    {
+      "file": "QGYyz_MVcBeNP4NjuGObqx1XmO1I4deyC4E.ttf",
+      "family": "Outfit",
+      "rawFamily": "Outfit",
+      "subfamily": "Bold",
+      "postscript": "Outfit-Bold",
+      "weight": 700,
+      "style": "normal",
+      "variationAxes": [],
+      "identified": true
+    },
+    {
+      "file": "QGYyz_MVcBeNP4NjuGObqx1XmO1I4e6yC4E.ttf",
+      "family": "Outfit",
+      "rawFamily": "Outfit SemiBold",
+      "subfamily": "Regular",
+      "postscript": "Outfit-SemiBold",
+      "weight": 600,
+      "style": "normal",
+      "variationAxes": [],
+      "identified": true
+    },
+    {
+      "file": "tDbY2o-flEEny0FZhsfKu5WU4zr3E_BX0PnT8RD8-qxjPQ.ttf",
+      "family": "JetBrains Mono",
+      "rawFamily": "JetBrains Mono Medium",
+      "subfamily": "Regular",
+      "postscript": "JetBrainsMono-Medium",
+      "weight": 500,
+      "style": "normal",
+      "variationAxes": [],
+      "identified": true
+    },
+    {
+      "file": "tDbY2o-flEEny0FZhsfKu5WU4zr3E_BX0PnT8RD8yKxjPQ.ttf",
+      "family": "JetBrains Mono",
+      "rawFamily": "JetBrains Mono",
+      "subfamily": "Regular",
+      "postscript": "JetBrainsMono-Regular",
+      "weight": 400,
+      "style": "normal",
+      "variationAxes": [],
+      "identified": true
+    }
+  ],
+  "families": [
+    {
+      "family": "JetBrains Mono",
+      "weights": [
+        400,
+        500
+      ],
+      "variable": false,
+      "fileCount": 2,
+      "files": [
+        "tDbY2o-flEEny0FZhsfKu5WU4zr3E_BX0PnT8RD8-qxjPQ.ttf",
+        "tDbY2o-flEEny0FZhsfKu5WU4zr3E_BX0PnT8RD8yKxjPQ.ttf"
+      ]
+    },
+    {
+      "family": "Outfit",
+      "weights": [
+        400,
+        500,
+        600,
+        700
+      ],
+      "variable": false,
+      "fileCount": 4,
+      "files": [
+        "QGYyz_MVcBeNP4NjuGObqx1XmO1I4QK1C4E.ttf",
+        "QGYyz_MVcBeNP4NjuGObqx1XmO1I4TC1C4E.ttf",
+        "QGYyz_MVcBeNP4NjuGObqx1XmO1I4deyC4E.ttf",
+        "QGYyz_MVcBeNP4NjuGObqx1XmO1I4e6yC4E.ttf"
+      ]
+    }
+  ],
+  "unidentified": [],
+  "meta": {
+    "generatedAt": "2026-06-14T08:03:56.963Z",
+    "tool": "fontkit"
+  }
+}

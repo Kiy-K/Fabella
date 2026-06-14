@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=1920, height=1080" />
+<title>beat-7-memory</title>
+<script src="https://cdn.jsdelivr.net/npm/gsap@3.14.2/dist/gsap.min.js"></script>
+<style>
+  html, body { width:1920px; height:1080px; margin:0; background:transparent; font-family:"Outfit",sans-serif; }
+  .wrap { width:1920px; height:1080px; display:flex; gap:34px; align-items:stretch; justify-content:center; padding:96px; box-sizing:border-box; }
+  .col { width:555px; display:flex; flex-direction:column; gap:18px; justify-content:center; }
+  .center { width:540px; display:flex; flex-direction:column; gap:16px; justify-content:center; }
+  .card { padding:20px 24px; border-radius:14px; border:1px solid #E2DCCD; background:#FFFFFF; box-shadow:0 8px 22px -18px rgba(20,30,20,0.18); }
+  .card h3 { margin:0 0 12px 0; font:600 14px "JetBrains Mono",monospace; color:#2E5A36; letter-spacing:0.14em; text-transform:uppercase; }
+  .fact { display:flex; align-items:flex-start; gap:10px; padding:8px 0; border-top:1px solid #EBE6D8; }
+  .fact:first-of-type { border-top:0; }
+  .fact .k { font:500 12px "JetBrains Mono",monospace; color:#6B6F78; letter-spacing:0.10em; text-transform:uppercase; min-width:120px; }
+  .fact .v { font:500 16px "Outfit",sans-serif; color:#1F2330; }
+  .summary { font:500 18px/1.5 "Outfit",sans-serif; color:#3A3F4A; }
+  .turn { display:flex; flex-direction:column; gap:14px; }
+  .msg { padding:14px 18px; border-radius:18px; max-width:520px; font:500 18px/1.4 "Outfit",sans-serif; }
+  .msg.parent { align-self:flex-end; background:#4F7A4A; color:#FFFFFF; border-bottom-right-radius:6px; }
+  .msg.fabella { background:#FFFFFF; color:#1F2330; border:1px solid #E2DCCD; border-bottom-left-radius:6px; }
+  .label { font:500 12px "JetBrains Mono",monospace; color:#6B6F78; letter-spacing:0.12em; text-transform:uppercase; margin-bottom:6px; }
+  .arrow { display:flex; align-items:center; gap:10px; color:#2E5A36; font:600 15px/1 "JetBrains Mono",monospace; letter-spacing:0.08em; text-transform:uppercase; }
+  .arrow::before, .arrow::after { content:""; flex:1; height:2px; background:linear-gradient(90deg, transparent, #4F7A4A, transparent); }
+  .bucket { padding:22px 24px; border-radius:18px; border:1px solid #4F7A4A; background:rgba(220,234,220,0.62); }
+  .bucket h3 { font:700 15px/1 "JetBrains Mono",monospace; color:#2E5A36; letter-spacing:0.14em; text-transform:uppercase; margin:0 0 14px; }
+  .bucket-row { display:flex; justify-content:space-between; gap:14px; padding:8px 0; border-top:1px solid rgba(79,122,74,0.18); font:500 15px/1.25 "Outfit",sans-serif; color:#1F2330; }
+  .bucket-row:first-of-type { border-top:0; }
+  .bucket-row span:first-child { color:#6B6F78; font-family:"JetBrains Mono",monospace; font-size:12px; letter-spacing:0.08em; text-transform:uppercase; }
+</style>
+</head>
+<body>
+<div data-composition-id="beat-7-memory" data-start="0" data-duration="12" data-width="1920" data-height="1080" data-track-index="1" style="position:relative; width:1920px; height:1080px;">
+  <div class="wrap">
+    <div class="col left">
+      <div class="label" id="b7-left-label">Long-term memory for this parent</div>
+      <div class="card" id="b7-card-1">
+        <h3>Durable facts</h3>
+        <div class="fact"><div class="k">situation</div><div class="v">Grandma had surgery in March 2026.</div></div>
+        <div class="fact"><div class="k">age</div><div class="v">7 years</div></div>
+        <div class="fact"><div class="k">tone</div><div class="v">gentle</div></div>
+      </div>
+      <div class="card" id="b7-card-2">
+        <h3>Rolling summary</h3>
+        <div class="summary">Parent is explaining grandma's hospitalization to a 7-year-old in a gentle register.</div>
+      </div>
+    </div>
+    <div class="center">
+      <div id="b7-read" class="arrow">read before draft</div>
+      <div id="b7-bucket" class="bucket">
+        <h3>HF Bucket JSON</h3>
+        <div class="bucket-row"><span>file</span><b>user-&lt;owner_key&gt;.json</b></div>
+        <div class="bucket-row"><span>profile</span><b>age, tone, child name</b></div>
+        <div class="bucket-row"><span>memory</span><b>facts + rolling summary</b></div>
+        <div class="bucket-row"><span>history</span><b>last 80 turns</b></div>
+      </div>
+      <div id="b7-write" class="arrow">write after turn</div>
+    </div>
+    <div class="col right">
+      <div class="label" id="b7-right-label">Follow-up question</div>
+      <div class="turn">
+        <div class="msg parent" id="b7-q">What if she asks if grandma will die?</div>
+        <div class="msg fabella" id="b7-a">That is a very big and sad question. Doctors are doing everything they can. We are staying close to her and thinking of her every day.</div>
+      </div>
+    </div>
+  </div>
+</div>
+<script>
+window.__timelines = window.__timelines || {};
+window.__timelines['beat-7-memory'] = gsap.timeline({ paused: true });
+</script>
+</body>
+</html>

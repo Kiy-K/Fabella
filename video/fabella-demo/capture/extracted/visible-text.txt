@@ -1,0 +1,30 @@
+[span] Fabella
+[small] small words for big questions
+[button] Age
+[button] Tone
+[span] gentle
+[button] Settings
+[button] Clear
+[h1] Tell me the
+[em] hard thing
+[p] Fabella drafts a short, kind, age-appropriate explanation. A second small model checks it. You can read it aloud with one tap.
+[button] My 7-year-old's grandma is in the hospital for surgery. She asked why grandma is there.
+[button] We're moving to a new house in 3 weeks. My kid is worried about leaving her friends.
+[button] My child's dog died yesterday. She keeps asking when the dog is coming back.
+[button] It's time to start sharing toys at preschool. My son refuses and has started hitting.
+[button] My 9-year-old wants a phone. All her friends have one and I said no.
+[button] There's a new baby coming in 4 months. My first grader is acting out and being mean to me.
+[span] Draft
+[div] Fabella checks every draft against a six-criterion rubric. Read-aloud uses VoxCPM2 on demand.
+[h2] Settings
+[label] Child's age
+[div] years
+[label] Child's name (optional)
+[label] Tone
+[label] Gentle
+[label] Matter-of-fact
+[label] Playful
+[button] Close
+[button] Save
+[footer] Built for the
+[a] Build Small Hackathon

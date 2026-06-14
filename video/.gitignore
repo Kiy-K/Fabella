@@ -1,0 +1,10 @@
+renders/
+snapshots/
+.thumbnails/
+work-*/
+fabella-demo/chrome-headless-shell/
+fabella-demo/renders/
+fabella-demo/snapshots/
+fabella-demo/capture/screenshots/scroll-*.png
+fabella-demo/capture/screenshots/rec-*.png
+fabella-demo/narration.wav
