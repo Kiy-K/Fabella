@@ -132,6 +132,15 @@ def download_judge(force: bool = False):
 
 MINUTES = 60
 
+# Demo latency policy:
+# - The two 4B LLM endpoints sit on the critical path for every explanation, so
+#   keep one warm replica while budget allows.
+# - TTS is also kept warm while budget allows; VoxCPM2 is small enough
+#   for a cheaper/newer L4 instead of A10G.
+LLM_MIN_CONTAINERS = 1
+TTS_MIN_CONTAINERS = 1
+TTS_GPU = "L4"
+
 
 def _vllm_cmd(model_dir: Path, served_name: str, port: int, extra: list[str]) -> list[str]:
     return [
@@ -150,6 +159,7 @@ def _vllm_cmd(model_dir: Path, served_name: str, port: int, extra: list[str]) ->
 @app.function(
     image=vllm_image,
     gpu="A10G",
+    min_containers=LLM_MIN_CONTAINERS,
     scaledown_window=10 * MINUTES,
     timeout=10 * MINUTES,
     volumes={MODEL_PATH: model_volume, "/root/.cache/vllm": vllm_cache_volume},
@@ -175,6 +185,7 @@ def serve_drafter():
 @app.function(
     image=vllm_image,
     gpu="A10G",
+    min_containers=LLM_MIN_CONTAINERS,
     scaledown_window=10 * MINUTES,
     timeout=10 * MINUTES,
     volumes={MODEL_PATH: model_volume, "/root/.cache/vllm": vllm_cache_volume},
@@ -307,7 +318,8 @@ def download_tts(force: bool = False):
 
 @app.function(
     image=tts_image,
-    gpu="A10G",
+    gpu=TTS_GPU,
+    min_containers=TTS_MIN_CONTAINERS,
     scaledown_window=10 * MINUTES,
     timeout=10 * MINUTES,
     volumes={MODEL_PATH: model_volume},

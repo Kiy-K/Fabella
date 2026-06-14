@@ -7,6 +7,7 @@ sdk: gradio
 sdk_version: 6.18.0
 app_file: app.py
 pinned: true
+hf_oauth: true
 license: apache-2.0
 short_description: Small words for big questions.
 ---
@@ -55,19 +56,20 @@ For example, given the situation *"My 7-year-old's grandma is in the hospital fo
 
 ## The stack
 
-- **HF Space** &mdash; custom HTML+CSS+JS frontend served by `gradio.Server` (FastAPI subclass). Storybook-modernist design, no default Gradio chrome.
-- **Modal** &mdash; three containers in one app. Drafter (Gemma 4 E4B-IT) runs with `--enable-auto-tool-choice --tool-call-parser gemma4 --language-model-only` (text-only today; the model itself is multimodal and could take audio input if we add a voice-memo feature later). Judge runs with no tool-calling flags. TTS (VoxCPM2) is a small FastAPI wrapper around the official `voxcpm` library. All three A10G, 10-min scaledown.
+- **HF Space** &mdash; custom HTML+CSS+JS frontend served by `gradio.Server` (FastAPI subclass). Chat-style, parent-friendly UI: welcome screen with example situations, alternating parent/Fabella turns, and a per-turn Read-aloud (VoxCPM2) button. No default Gradio chrome. HF OAuth is enabled for personalization.
+- **HF Bucket per-user JSON** &mdash; minimal chat history and parent preferences persist in the mounted bucket at `/data/fabella-data/user-<owner_key>.json`.
+- **Modal** &mdash; three containers in one app. Drafter (Gemma 4 E4B-IT) runs with `--enable-auto-tool-choice --tool-call-parser gemma4 --language-model-only` (text-only today; the model itself is multimodal and could take audio input if we add a voice-memo feature later). Judge runs with no tool-calling flags. TTS (VoxCPM2) is a small FastAPI wrapper around the official `voxcpm` library. Drafter and judge stay warm on A10G for demos; TTS stays warm on L4 so read-aloud has no cold start.
 - **LangChain 1.x** ReAct loop with a custom middleware that jumps to `end` after a successful validation or after a hard cap of two tool calls.
 - **Pydantic v2** for the judge's structured output.
 
 ## Files
 
-- `app.py` &mdash; `gradio.Server` app, custom HTML+CSS+JS, `@app.api()` endpoint, no-op `@spaces.GPU` placeholder for HF runtime
+- `app.py` &mdash; `gradio.Server` app, custom HTML+CSS+JS, `@app.api()` endpoint, HF OAuth-aware history APIs, no-op `@spaces.GPU` placeholder for HF runtime
 - `agent.py` &mdash; LangChain ReAct drafter, `validate_explanation` tool, middleware
 - `judge.py` &mdash; Pydantic-validated judge with one repair retry
 - `schema.py` &mdash; `ExplainRequest` dataclass + `JudgeVerdict` Pydantic model + `JudgeFailed` exception
 - `llm.py` &mdash; `FabellaVLLM` BaseChatModel wrapping vLLM's OpenAI-compatible API
-- `modal_app.py` &mdash; Modal deployment (drafter + judge + VoxCPM2 TTS on separate A10Gs)
+- `modal_app.py` &mdash; Modal deployment (drafter + judge on A10G, VoxCPM2 TTS on L4)
 - `safety.py` &mdash; input sanitization, profanity block, `explain_to_words(tone)`
 
 ## Run locally
@@ -82,7 +84,7 @@ export MODAL_TTS_URL=https://khoitruong071510--fabella-serve-tts.modal.run
 python app.py
 ```
 
-The frontend runs on CPU locally. The two LLM Modal containers cold-start in ~2 min each on the first request of a new session; the TTS container cold-starts separately only when **Read aloud** is clicked.
+The frontend runs on CPU locally. All three Modal inference containers are kept warm while budget allows: drafter and judge on A10G, TTS on L4.
 
 ## Constraints honored
 

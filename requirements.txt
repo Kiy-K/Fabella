@@ -3,3 +3,4 @@ langchain>=1.0
 langchain-core>=1.0
 langchain-openai>=0.3
 openai>=1.76
+huggingface_hub[oauth]>=0.24

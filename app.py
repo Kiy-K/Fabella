@@ -1,12 +1,12 @@
-"""Fabella — small words for big questions.
+"""Fabella - small words for big questions.
 
 A Gradio Server (FastAPI subclass) serves a custom HTML+CSS+JS page. The
 parent describes a hard-to-explain situation; Fabella drafts a short,
 kind, age-appropriate explanation, validated by a second small model.
 
 Architecture (see modal_app.py for the server side):
-  Gemma 4 E4B (drafter, A10G)  — writes the explanation
-  Nemotron-3 Nano 4B (judge, A10G) — multi-criteria review
+  Gemma 4 E4B (drafter, A10G)  - writes the explanation
+  Nemotron-3 Nano 4B (judge, A10G) - multi-criteria review
 """
 
 import os
@@ -17,6 +17,11 @@ import base64
 import json
 import urllib.error
 import urllib.request
+import re
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from threading import Lock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -38,7 +43,8 @@ def _silence_asyncio_invalid_fd_warning() -> None:
 
 _silence_asyncio_invalid_fd_warning()
 
-from fastapi.responses import HTMLResponse
+from fastapi import Request
+from fastapi.responses import HTMLResponse, JSONResponse
 
 from agent import run_agent
 from schema import ExplainRequest
@@ -61,6 +67,21 @@ MODAL_TTS_URL = os.environ.get(
     "https://khoitruong071510--fabella-serve-tts.modal.run",
 )
 
+# HF Spaces bucket mount. The current Space has a writable bucket mounted at
+# /models. We avoid a separate database cloud API by storing one minimal JSON
+# file per parent (HF user or anonymous browser session) inside that bucket.
+# This keeps persistence tied to HF infrastructure only.
+DATA_DIR = Path(os.environ.get("FABELLA_DATA_DIR", "/data/fabella-data"))
+_history_lock = Lock()
+_MAX_MESSAGES = 80
+_SAFE_KEY = re.compile(r"[^a-zA-Z0-9._-]+")
+
+try:
+    from huggingface_hub import attach_huggingface_oauth, parse_huggingface_oauth
+except Exception:
+    attach_huggingface_oauth = None
+    parse_huggingface_oauth = None
+
 try:
     import spaces
 
@@ -73,7 +94,112 @@ except ImportError:
 from gradio import Server
 
 app = Server()
+if attach_huggingface_oauth is not None:
+    try:
+        attach_huggingface_oauth(app)
+    except Exception as e:
+        print(f"[auth] OAuth endpoints disabled: {type(e).__name__}: {e}", flush=True)
 
+
+
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _oauth_user(request: Request) -> dict:
+    if parse_huggingface_oauth is None:
+        return {"signed_in": False}
+    try:
+        info = parse_huggingface_oauth(request)
+    except Exception as e:
+        print(f"[auth] parse failed: {type(e).__name__}: {e}", flush=True)
+        return {"signed_in": False}
+    if info is None:
+        return {"signed_in": False}
+    user = getattr(info, "user_info", None)
+    username = getattr(user, "preferred_username", None) or getattr(user, "name", None) or getattr(user, "sub", None)
+    if not username:
+        return {"signed_in": False}
+    return {
+        "signed_in": True,
+        "username": str(username),
+        "display_name": str(getattr(user, "name", "") or username),
+        "avatar_url": str(getattr(user, "picture", "") or ""),
+    }
+
+
+def _owner_from_request(request: Request, session_id: str) -> tuple[str, str | None, str]:
+    user = _oauth_user(request)
+    clean_session = (session_id or "").strip()[:80]
+    if not clean_session:
+        clean_session = str(uuid.uuid4())
+    if user.get("signed_in"):
+        return f"hf:{user['username']}", user["username"], clean_session
+    return f"anon:{clean_session}", None, clean_session
+
+
+def _safe_slug(value: str) -> str:
+    cleaned = _SAFE_KEY.sub("-", value).strip("-")
+    return (cleaned or "anon")[:80]
+
+
+def _history_path(owner_key: str) -> Path:
+    return DATA_DIR / f"user-{_safe_slug(owner_key)}.json"
+
+
+def _empty_history() -> dict:
+    return {"messages": [], "profile": None, "updated_at": None}
+
+
+def _read_history(owner_key: str) -> dict:
+    path = _history_path(owner_key)
+    if not path.exists():
+        return _empty_history()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"[history] read failed for {owner_key}: {type(e).__name__}: {e}", flush=True)
+        return _empty_history()
+    if not isinstance(data, dict):
+        return _empty_history()
+    data.setdefault("messages", [])
+    data.setdefault("profile", None)
+    return data
+
+
+def _write_history(owner_key: str, data: dict) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    path = _history_path(owner_key)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _public_messages(messages: list) -> list:
+    return [
+        {
+            "role": m.get("role"),
+            "content": m.get("content", ""),
+            "age": m.get("age"),
+            "child_name": m.get("child_name") or "",
+            "tone": m.get("tone") or "",
+            "created_at": m.get("created_at", ""),
+        }
+        for m in messages[-_MAX_MESSAGES:]
+    ]
+
+
+def _sectioned_to_text(sectioned: str) -> str:
+    parts = (sectioned or "").split(SECTION_SEP)
+    labels = ["Opener", "Body", "Closer", "If they ask more"]
+    lines = []
+    for label, part in zip(labels, parts):
+        text = (part or "").strip()
+        if text:
+            lines.append(f"{label}: {text}")
+    return "\n\n".join(lines)
 
 def _make_drafter(seed: int = 0):
     from llm import FabellaVLLM
@@ -82,7 +208,14 @@ def _make_drafter(seed: int = 0):
 
 def _make_judge(seed: int = 0):
     from llm import FabellaVLLM
-    return FabellaVLLM(base_url=MODAL_JUDGE_URL, model_name="nemotron-3-4b", seed=seed)
+    return FabellaVLLM(
+        base_url=MODAL_JUDGE_URL,
+        model_name="nemotron-3-4b",
+        temperature=0.0,
+        top_p=1.0,
+        max_tokens=1024,
+        seed=seed,
+    )
 
 
 # Sections joined with U+001F (Unit Separator) so the frontend can split
@@ -107,7 +240,7 @@ def _make_explanation_sync(situation: str, age: int, child_name: str, tone: str,
     if not clean_situation:
         return SECTION_SEP.join([
             "Fabella (empty)",
-            "Tell me about the situation first — what's going on, in a sentence or two?",
+            "Tell me about the situation first - what's going on, in a sentence or two?",
             "", "",
         ])
 
@@ -211,6 +344,95 @@ def make_audio(text: str, tone: str) -> str:
     return _make_audio_sync(text, tone)
 
 
+
+@app.get("/api/me")
+async def api_me(request: Request):
+    user = _oauth_user(request)
+    return JSONResponse(user)
+
+
+@app.get("/api/history")
+async def api_history(request: Request, session_id: str = ""):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    owner_key, _, session_id = _owner_from_request(request, session_id)
+    with _history_lock:
+        data = _read_history(owner_key)
+    return JSONResponse({
+        "session_id": session_id,
+        "profile": data.get("profile"),
+        "messages": _public_messages(data.get("messages", [])),
+    })
+
+
+@app.post("/api/history/append")
+async def api_history_append(request: Request):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    payload = await request.json()
+    session_id = str(payload.get("session_id") or "")
+    owner_key, _, session_id = _owner_from_request(request, session_id)
+    parent = sanitize_situation(payload.get("parent") or "")
+    fabella = _clean_audio_text(payload.get("fabella") or "")
+    if not parent and not fabella:
+        return JSONResponse({"ok": False, "error": "nothing to store"}, status_code=400)
+    try:
+        age = int(payload.get("age") or 0) or None
+    except Exception:
+        age = None
+    child_name = sanitize_name(payload.get("child_name") or "")
+    tone = (payload.get("tone") or "gentle").strip().lower()
+    if tone not in ("gentle", "matter-of-fact", "playful"):
+        tone = "gentle"
+    now = _now_iso()
+    with _history_lock:
+        data = _read_history(owner_key)
+        if parent:
+            data["messages"].append({
+                "role": "parent",
+                "content": parent,
+                "age": age,
+                "child_name": child_name,
+                "tone": tone,
+                "created_at": now,
+            })
+        if fabella:
+            data["messages"].append({
+                "role": "fabella",
+                "content": fabella,
+                "age": age,
+                "child_name": child_name,
+                "tone": tone,
+                "created_at": now,
+            })
+        data["messages"] = data["messages"][-_MAX_MESSAGES:]
+        profile = data.get("profile") or {}
+        profile.update({
+            "child_name": child_name or profile.get("child_name", ""),
+            "child_age": age or profile.get("child_age"),
+            "preferred_tone": tone or profile.get("preferred_tone", "gentle"),
+            "updated_at": now,
+        })
+        data["profile"] = profile
+        data["updated_at"] = now
+        _write_history(owner_key, data)
+    return JSONResponse({"ok": True, "session_id": session_id})
+
+
+@app.post("/api/history/clear")
+async def api_history_clear(request: Request):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    payload = await request.json()
+    session_id = str(payload.get("session_id") or "")
+    owner_key, _, session_id = _owner_from_request(request, session_id)
+    with _history_lock:
+        path = _history_path(owner_key)
+        if path.exists():
+            try:
+                path.unlink()
+            except Exception as e:
+                print(f"[history] clear failed for {owner_key}: {type(e).__name__}: {e}", flush=True)
+    return JSONResponse({"ok": True, "session_id": session_id})
+
+
 # --- HTML page --------------------------------------------------------------
 
 TONE_CHOICES = [
@@ -233,1331 +455,790 @@ INDEX_HTML = r"""<!doctype html>
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-<title>Fabella — small words for big questions</title>
+<title>Fabella - small words for big questions</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght,SOFT,WONK@9..144,300..900,0..100,0..1&family=Literata:ital,opsz,wght@0,7..72,400..800;1,7..72,400..800&family=Fragment+Mono&display=swap">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap">
 <style>
-/* =========================================================================
-   FABELLA — small words for big questions
-   Cool palette, NOT the banned warm-cream+brass+espresso default.
-   Same storybook-modernist language as before.
-   ========================================================================= */
-
 :root {
-  --bone:       #ece9e0;
-  --bone-deep:  #e3dfd3;
-  --paper:      #f4f1e7;
-  --paper-2:    #faf7ed;
-  --ink:        #1a1d1f;
-  --ink-soft:   #3d4144;
-  --ink-mute:   #6b6e6f;
-  --rule:       #c8c2b1;
-  --rule-soft:  #d9d4c2;
-  --forest:     #2d4a2b;
-  --forest-ink: #1a2f18;
-  --wax:        #a8341f;
-  --wax-ink:    #7a2415;
-
-  --serif: "Source Serif 4", "Iowan Old Style", Georgia, "Times New Roman", serif;
-  --mono:  "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
-
-  --pad-x: clamp(20px, 4.5vw, 56px);
-  --shadow-leaf: 0 1px 0 rgba(26,31,27,0.04), 0 12px 28px -18px rgba(26,31,27,0.18);
-  --ease: cubic-bezier(0.16, 1, 0.3, 1);
+  --bg: #f7f4ec;
+  --bg-2: #efeae0;
+  --surface: #ffffff;
+  --surface-2: #f3efe6;
+  --line: #e2dccd;
+  --line-soft: #ebe6d8;
+  --text: #1f2330;
+  --text-soft: #3a3f4a;
+  --text-muted: #6b6f78;
+  --accent: #4f7a4a;
+  --accent-strong: #2e5a36;
+  --accent-soft: #dceadc;
+  --bubble-parent: #4f7a4a;
+  --bubble-parent-text: #ffffff;
+  --bubble-fabella: #ffffff;
+  --bubble-fabella-text: #1f2330;
+  --danger: #b04a3a;
+  --radius: 18px;
+  --radius-sm: 12px;
+  --pad-x: clamp(16px, 4vw, 40px);
+  --shadow: 0 1px 0 rgba(0,0,0,0.02), 0 12px 30px -22px rgba(20,30,20,0.18);
+  --ease: cubic-bezier(.2,.7,.2,1);
+  --font-sans: "Outfit", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14181d;
+    --bg-2: #1a1f25;
+    --surface: #1d242b;
+    --surface-2: #232a32;
+    --line: #2d343d;
+    --line-soft: #262c34;
+    --text: #ece7d8;
+    --text-soft: #cfd2cc;
+    --text-muted: #8d9089;
+    --accent: #8fbf83;
+    --accent-strong: #b5d3a9;
+    --accent-soft: #2a3a30;
+    --bubble-parent: #2e5a36;
+    --bubble-parent-text: #f1f1ec;
+    --bubble-fabella: #232a32;
+    --bubble-fabella-text: #ece7d8;
+  }
 }
 * { box-sizing: border-box; }
-html, body { margin: 0; padding: 0; }
-html { background: var(--bone); }
-body {
-  color: var(--ink);
-  font-family: var(--serif);
-  font-size: 17px;
-  line-height: 1.55;
-  background: var(--bone);
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-  text-rendering: optimizeLegibility;
-  font-feature-settings: "kern", "liga", "onum";
-  min-height: 100dvh;
-  overflow-x: hidden;
-}
-body::before {
-  content: "";
-  position: fixed; inset: 0;
-  pointer-events: none;
-  z-index: 60;
-  opacity: 0.5;
-  mix-blend-mode: multiply;
-  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='160' height='160'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' seed='4'/><feColorMatrix values='0 0 0 0 0.55  0 0 0 0 0.50  0 0 0 0 0.40  0 0 0 0.07 0'/></filter><rect width='100%25' height='100%25' filter='url(%23n)'/></svg>");
-}
-@media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after { animation: none !important; transition: none !important; }
-}
+html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); font-family: var(--font-sans); -webkit-font-smoothing: antialiased; }
+body { min-height: 100vh; }
+a { color: var(--accent-strong); }
 
-/* ---- header strip ---- */
-.imprint {
-  padding: 14px var(--pad-x);
+.appbar {
+  position: sticky;
+  top: 0;
+  z-index: 5;
   display: flex;
-  align-items: baseline;
+  align-items: center;
   justify-content: space-between;
-  gap: 20px;
-  border-bottom: 1px solid var(--rule);
-  font-family: var(--mono);
-  font-size: 11px;
-  letter-spacing: 0.18em;
-  text-transform: uppercase;
-  color: var(--ink-soft);
-  background: var(--bone);
+  padding: 14px var(--pad-x);
+  background: color-mix(in srgb, var(--bg) 85%, transparent);
+  backdrop-filter: saturate(140%) blur(8px);
+  border-bottom: 1px solid var(--line-soft);
 }
-.imprint .wordmark {
-  font-family: var(--serif);
-  font-style: italic;
-  font-size: 19px;
-  letter-spacing: 0.005em;
-  text-transform: none;
-  color: var(--ink);
-  font-weight: 400;
-}
-.imprint .wordmark b { font-style: normal; font-weight: 700; color: var(--forest-ink); }
-.imprint .meta { display: flex; gap: 22px; }
-.imprint .meta span b { color: var(--ink); font-weight: 700; }
-
-/* ---- main split ---- */
-.stage {
-  display: grid;
-  grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr);
-  gap: clamp(24px, 4vw, 64px);
-  padding: clamp(28px, 5vw, 64px) var(--pad-x) clamp(40px, 6vw, 88px);
-  max-width: 1280px;
-  margin: 0 auto;
-  align-items: start;
-}
-@media (max-width: 880px) { .stage { grid-template-columns: 1fr; } }
-
-/* ---- left: form ---- */
-.col-form { position: sticky; top: 28px; }
-@media (max-width: 880px) { .col-form { position: static; } }
-.title-block { margin-bottom: 28px; }
-.title-block h1 {
-  font-family: var(--serif);
-  font-size: clamp(40px, 6.4vw, 64px);
-  line-height: 0.98;
-  letter-spacing: -0.015em;
-  font-weight: 700;
-  margin: 0 0 14px 0;
-  color: var(--ink);
-  text-wrap: balance;
-}
-.title-block h1 em { font-style: italic; font-weight: 400; color: var(--forest-ink); }
-.title-block .lede {
-  font-size: 17px;
-  line-height: 1.55;
-  color: var(--ink-soft);
-  max-width: 40ch;
-  margin: 0;
-}
-form { display: flex; flex-direction: column; gap: 22px; margin-top: 8px; }
-.field { display: flex; flex-direction: column; gap: 8px; }
-.label {
-  font-family: var(--mono);
-  font-size: 10.5px;
-  font-weight: 700;
-  letter-spacing: 0.22em;
-  text-transform: uppercase;
-  color: var(--ink-mute);
-}
-.label small { text-transform: none; letter-spacing: 0; font-weight: 400; font-family: var(--serif); font-style: italic; font-size: 12px; color: var(--ink-mute); margin-left: 6px; }
-.hint {
-  font-family: var(--serif);
-  font-style: italic;
-  font-size: 13px;
-  color: var(--ink-mute);
-  line-height: 1.5;
-  margin-top: 2px;
-}
-
-input[type="text"], textarea {
-  font-family: var(--serif);
-  font-size: 17px;
-  line-height: 1.45;
-  color: var(--ink);
-  background: var(--paper);
-  border: 1px solid var(--rule);
-  border-radius: 0;
-  padding: 12px 14px;
-  outline: none;
-  transition: border-color 0.18s var(--ease), background 0.18s var(--ease);
-  width: 100%;
-  font-feature-settings: "kern", "liga";
-}
-textarea { min-height: 110px; resize: vertical; line-height: 1.55; }
-input[type="text"]::placeholder, textarea::placeholder { color: var(--ink-mute); font-style: italic; }
-input[type="text"]:focus, textarea:focus {
-  border-color: var(--forest);
-  background: var(--paper-2);
-}
-
-.age { display: grid; grid-template-columns: 1fr auto; align-items: baseline; gap: 14px; }
-.age .readout {
-  font-family: var(--serif);
-  font-size: 30px;
-  line-height: 1;
-  color: var(--ink);
-  font-feature-settings: "tnum";
-  font-weight: 600;
-}
-.age .readout small { font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.18em; text-transform: uppercase; color: var(--ink-mute); margin-left: 6px; vertical-align: middle; }
-.age input[type="range"] {
-  grid-column: 1 / -1;
-  -webkit-appearance: none; appearance: none;
-  width: 100%; height: 4px;
-  background: var(--rule);
-  border-radius: 999px;
-  outline: none;
-}
-.age input[type="range"]::-webkit-slider-thumb {
-  -webkit-appearance: none; appearance: none;
-  width: 22px; height: 22px;
-  border-radius: 50%;
-  background: var(--forest);
-  cursor: grab;
-  border: 3px solid var(--paper);
-  box-shadow: 0 0 0 1px var(--forest);
-  transition: transform 0.15s var(--ease);
-}
-.age input[type="range"]::-webkit-slider-thumb:active { transform: scale(0.94); cursor: grabbing; }
-.age input[type="range"]::-moz-range-thumb {
-  width: 22px; height: 22px; border-radius: 50%;
-  background: var(--forest); border: 3px solid var(--paper);
-  box-shadow: 0 0 0 1px var(--forest);
-}
-
-/* tone radio as 3 segmented buttons */
-.tone-row {
-  display: grid; grid-template-columns: 1fr 1fr 1fr;
-  border: 1px solid var(--rule);
-  border-radius: 0;
-  overflow: hidden;
-  background: var(--paper);
-}
-.tone-row label {
-  text-align: center;
-  padding: 11px 8px;
-  font-family: var(--mono);
-  font-size: 11px;
-  letter-spacing: 0.16em;
-  text-transform: uppercase;
-  color: var(--ink-soft);
-  cursor: pointer;
-  border-right: 1px solid var(--rule);
-  transition: background 0.18s var(--ease), color 0.18s var(--ease);
-  font-weight: 500;
-  user-select: none;
-}
-.tone-row label:last-child { border-right: none; }
-.tone-row input { display: none; }
-.tone-row label.is-on { background: var(--ink); color: var(--bone); }
-
-/* example chips */
-.examples { display: flex; flex-direction: column; gap: 6px; }
-.ex-chip {
-  font-family: var(--serif);
-  font-size: 14px;
-  line-height: 1.4;
-  color: var(--ink-soft);
-  background: var(--paper);
-  border: 1px solid var(--rule-soft);
+.brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 18px; letter-spacing: -0.01em; }
+.brand-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--accent); }
+.brand small { color: var(--text-muted); font-weight: 500; margin-left: 6px; }
+.appbar-actions { display: flex; align-items: center; gap: 8px; }
+.chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  font: 500 12px/1 var(--font-sans);
   padding: 8px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--text-soft);
   cursor: pointer;
-  text-align: left;
-  border-radius: 0;
-  transition: border-color 0.18s var(--ease), color 0.18s var(--ease), background 0.18s var(--ease);
 }
-.ex-chip:hover { border-color: var(--ink-soft); color: var(--ink); background: var(--paper-2); }
-.ex-chip small { display: block; font-family: var(--mono); font-size: 9.5px; letter-spacing: 0.16em; text-transform: uppercase; color: var(--ink-mute); margin-bottom: 2px; }
+.chip.is-active { border-color: var(--accent); color: var(--accent-strong); background: var(--accent-soft); }
+.chip-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-muted); }
+.chip-dot.is-on { background: var(--accent); }
+.btn-ghost {
+  border: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--text-soft);
+  border-radius: 999px;
+  padding: 8px 14px;
+  font: 500 13px var(--font-sans);
+  cursor: pointer;
+}
+.btn-ghost:hover { color: var(--text); border-color: var(--accent); }
 
-/* submit */
-.actions { display: flex; align-items: center; gap: 14px; margin-top: 6px; flex-wrap: wrap; }
-.btn-primary {
-  font-family: var(--serif);
-  font-size: 17px;
-  font-weight: 600;
-  letter-spacing: 0.005em;
-  color: var(--bone);
-  background: var(--wax);
-  border: 1px solid var(--wax-ink);
-  padding: 13px 22px;
-  border-radius: 0;
+.thread {
+  max-width: 760px;
+  margin: 0 auto;
+  padding: clamp(28px, 4vw, 48px) var(--pad-x) 200px;
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+}
+.welcome { margin-top: 6vh; }
+.welcome h1 {
+  font-size: clamp(32px, 5vw, 44px);
+  line-height: 1.05;
+  letter-spacing: -0.02em;
+  margin: 0 0 10px;
+  font-weight: 700;
+}
+.welcome h1 em { font-style: normal; color: var(--accent-strong); }
+.welcome p { color: var(--text-soft); margin: 0 0 22px; max-width: 56ch; }
+.examples { display: flex; flex-direction: column; gap: 8px; max-width: 56ch; }
+.example-btn {
+  text-align: left;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  color: var(--text);
+  border-radius: var(--radius-sm);
+  padding: 12px 14px;
+  font: 500 14px var(--font-sans);
+  cursor: pointer;
+}
+.example-btn:hover { border-color: var(--accent); background: color-mix(in srgb, var(--accent-soft) 40%, var(--surface)); }
+
+.turn { display: flex; gap: 12px; align-items: flex-start; }
+.turn.user { flex-direction: row-reverse; }
+.avatar {
+  width: 32px; height: 32px;
+  flex: 0 0 32px;
+  border-radius: 50%;
+  background: var(--surface-2);
+  display: flex; align-items: center; justify-content: center;
+  font: 600 12px var(--font-sans);
+  color: var(--text-muted);
+  border: 1px solid var(--line-soft);
+}
+.avatar.fabella { background: var(--accent-soft); color: var(--accent-strong); border-color: transparent; }
+.avatar.user { background: var(--bubble-parent); color: var(--bubble-parent-text); border-color: transparent; }
+.bubble {
+  max-width: min(72ch, calc(100% - 56px));
+  padding: 14px 16px;
+  border-radius: 18px;
+  background: var(--bubble-fabella);
+  color: var(--bubble-fabella-text);
+  border: 1px solid var(--line);
+  line-height: 1.5;
+  font-size: 15.5px;
+  box-shadow: var(--shadow);
+}
+.turn.user .bubble {
+  background: var(--bubble-parent);
+  color: var(--bubble-parent-text);
+  border-color: transparent;
+  border-bottom-right-radius: 6px;
+}
+.turn.fabella .bubble { border-bottom-left-radius: 6px; }
+.bubble p { margin: 0 0 8px; }
+.bubble p:last-child { margin-bottom: 0; }
+
+.section-label {
+  display: inline-block;
+  font: 600 10px var(--font-mono);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--accent-strong);
+  margin: 12px 0 4px;
+}
+.section-label:first-child { margin-top: 0; }
+.section-text { white-space: pre-wrap; }
+
+.turn-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+  flex-wrap: wrap;
+}
+.btn-read {
+  border: 1px solid var(--accent);
+  background: var(--surface);
+  color: var(--accent-strong);
+  border-radius: 999px;
+  padding: 6px 12px;
+  font: 500 12.5px var(--font-sans);
   cursor: pointer;
   display: inline-flex;
   align-items: center;
+  gap: 6px;
+}
+.btn-read:hover { background: var(--accent-soft); }
+.btn-read[disabled] { opacity: 0.6; cursor: progress; }
+.btn-read .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
+.audio-inline { width: 100%; margin-top: 8px; display: none; }
+.audio-inline.is-on { display: block; }
+.audio-status { font: 500 11px var(--font-mono); color: var(--text-muted); margin-top: 4px; letter-spacing: 0.04em; }
+
+.composer {
+  position: fixed;
+  left: 0; right: 0; bottom: 0;
+  padding: 14px var(--pad-x) 22px;
+  background: linear-gradient(180deg, transparent, var(--bg) 24px);
+  z-index: 4;
+}
+.composer-inner {
+  max-width: 760px;
+  margin: 0 auto;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 22px;
+  box-shadow: 0 24px 60px -28px rgba(20,30,20,0.18), 0 2px 0 rgba(0,0,0,0.02);
+  padding: 10px 12px 10px 16px;
+  display: grid;
+  grid-template-columns: 1fr auto;
   gap: 10px;
-  box-shadow: 0 1px 0 rgba(0,0,0,0.04), 0 4px 0 -1px var(--wax-ink);
-  transition: transform 0.12s var(--ease), box-shadow 0.12s var(--ease), background 0.18s var(--ease);
-  white-space: nowrap;
+  align-items: end;
 }
-.btn-primary:hover { background: var(--wax-ink); }
-.btn-primary:active { transform: translateY(2px); box-shadow: 0 1px 0 rgba(0,0,0,0.04), 0 2px 0 -1px var(--wax-ink); }
-.btn-primary:disabled { background: var(--ink-mute); border-color: var(--ink-mute); box-shadow: 0 1px 0 rgba(0,0,0,0.04); cursor: progress; transform: none; }
-.btn-primary .arrow { display: inline-block; transition: transform 0.18s var(--ease); }
-.btn-primary:hover:not(:disabled) .arrow { transform: translateX(3px); }
-.btn-ghost {
-  font-family: var(--mono);
-  font-size: 11px;
-  letter-spacing: 0.18em;
-  text-transform: uppercase;
-  color: var(--ink-soft);
-  background: transparent;
-  border: none;
-  cursor: pointer;
-  padding: 8px 4px;
-  border-bottom: 1px dashed var(--ink-mute);
-  transition: color 0.18s var(--ease), border-color 0.18s var(--ease);
-}
-.btn-ghost:hover { color: var(--ink); border-color: var(--ink); }
-.btn-ghost:disabled { opacity: 0.4; cursor: not-allowed; }
-.btn-read {
-  font-family: var(--mono);
-  font-size: 10.5px;
-  letter-spacing: 0.18em;
-  text-transform: uppercase;
-  color: var(--forest-ink);
-  background: transparent;
-  border: 1px solid var(--rule);
-  padding: 9px 12px;
-  cursor: pointer;
-  transition: background 0.18s var(--ease), color 0.18s var(--ease), border-color 0.18s var(--ease);
-}
-.btn-read:hover { background: var(--paper-2); border-color: var(--forest); color: var(--ink); }
-.btn-read:disabled { opacity: 0.45; cursor: progress; }
-.seed-pill {
-  font-family: var(--mono);
-  font-size: 10.5px;
-  letter-spacing: 0.18em;
-  text-transform: uppercase;
-  color: var(--ink-mute);
-  padding-left: 4px;
-}
-
-/* ---- right: book page ---- */
-.col-story { position: relative; min-height: 60vh; }
-.book {
-  background: var(--paper);
-  border: 1px solid var(--rule);
-  box-shadow: var(--shadow-leaf);
-  padding: clamp(28px, 4.5vw, 56px) clamp(24px, 4vw, 52px);
-  position: relative;
-}
-.book::before {
-  content: "";
-  position: absolute; left: 18px; top: 18px; bottom: 18px; right: 18px;
-  border: 1px solid var(--rule-soft);
-  pointer-events: none;
-}
-.book .corner {
-  position: absolute;
-  width: 22px; height: 22px;
-  pointer-events: none;
-  color: var(--ink-mute);
-}
-.book .corner.tl { top: 10px; left: 10px; }
-.book .corner.tr { top: 10px; right: 10px; transform: scaleX(-1); }
-.book .corner.bl { bottom: 10px; left: 10px; transform: scaleY(-1); }
-.book .corner.br { bottom: 10px; right: 10px; transform: scale(-1,-1); }
-.book .inner { position: relative; z-index: 1; }
-
-.cover { display: flex; flex-direction: column; gap: 18px; min-height: 380px; justify-content: center; }
-.cover .folio { font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.22em; text-transform: uppercase; color: var(--ink-mute); }
-.cover h2 {
-  font-family: var(--serif);
-  font-size: clamp(34px, 4.5vw, 50px);
-  line-height: 1.02;
-  letter-spacing: -0.012em;
-  font-weight: 600;
-  margin: 0;
-  color: var(--ink);
-  font-style: italic;
-  font-weight: 400;
-}
-.cover h2 b { font-style: normal; font-weight: 700; color: var(--forest-ink); }
-.cover p { font-size: 16px; line-height: 1.6; color: var(--ink-soft); max-width: 40ch; margin: 0; }
-
-.writing { display: flex; flex-direction: column; gap: 14px; min-height: 380px; justify-content: center; }
-.writing .penline {
-  font-family: var(--mono);
-  font-size: 10.5px;
-  letter-spacing: 0.22em;
-  text-transform: uppercase;
-  color: var(--ink-mute);
-  display: inline-flex; align-items: center; gap: 10px;
-}
-.writing .quill {
-  display: inline-block; width: 14px; height: 14px; background: var(--ink);
-  -webkit-mask: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><path d='M3 21l3.5-1 11-11a2.83 2.83 0 0 0-4-4l-11 11L3 21z' fill='currentColor'/></svg>") center/contain no-repeat;
-          mask: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><path d='M3 21l3.5-1 1 1-11a2.83 2.83 0 0 0-4-4l-11 11L3 21z' fill='currentColor'/></svg>") center/contain no-repeat;
-  transform-origin: 50% 80%;
-  animation: nib 1.6s var(--ease) infinite;
-}
-@keyframes nib { 0%, 100% { transform: rotate(-8deg) translateX(0); } 50% { transform: rotate(14deg) translateX(2px); } }
-@media (prefers-reduced-motion: reduce) { .writing .quill { animation: none; } }
-.writing .progress {
-  height: 1px;
-  background: linear-gradient(90deg, var(--forest) 0%, var(--forest) var(--p,40%), var(--rule) var(--p,40%), var(--rule) 100%);
+.composer textarea {
   width: 100%;
-  max-width: 320px;
-  transition: background 0.4s var(--ease);
+  resize: none;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  font: 400 15px var(--font-sans);
+  color: var(--text);
+  padding: 8px 0;
+  min-height: 28px;
+  max-height: 200px;
 }
-.writing p { font-size: 16px; line-height: 1.6; color: var(--ink-soft); max-width: 40ch; margin: 0; }
-
-/* the actual explanation page */
-.expl { animation: arrive 0.55s var(--ease) both; }
-@keyframes arrive { from { opacity: 0; transform: translateY(8px) rotate(-0.2deg); } to { opacity: 1; transform: translateY(0) rotate(0); } }
-@media (prefers-reduced-motion: reduce) { .expl { animation: none; } }
-
-.expl .byline {
-  font-family: var(--mono);
-  font-size: 10.5px;
-  letter-spacing: 0.22em;
-  text-transform: uppercase;
-  color: var(--ink-mute);
-  margin-bottom: 18px;
-  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+.composer textarea::placeholder { color: var(--text-muted); }
+.composer-controls { display: flex; align-items: center; gap: 8px; }
+.btn-send {
+  border: 0;
+  background: var(--accent);
+  color: #ffffff;
+  border-radius: 999px;
+  padding: 10px 18px;
+  font: 600 14px var(--font-sans);
+  cursor: pointer;
+  display: inline-flex; align-items: center; gap: 8px;
 }
-.expl .byline .dot { width: 4px; height: 4px; border-radius: 50%; background: var(--ink-mute); display: inline-block; }
-.expl .byline .label-tiny { color: var(--ink-soft); font-weight: 700; }
-
-.expl h2.title {
-  font-family: var(--serif);
-  font-size: clamp(28px, 3.6vw, 36px);
-  line-height: 1.1;
-  letter-spacing: -0.012em;
-  font-weight: 700;
-  margin: 0 0 22px 0;
-  color: var(--ink);
-  text-wrap: balance;
-}
-.expl h2.title small {
-  display: block;
-  font-family: var(--mono);
-  font-size: 10.5px;
-  letter-spacing: 0.22em;
-  text-transform: uppercase;
-  color: var(--ink-mute);
-  font-weight: 400;
+.btn-send[disabled] { opacity: 0.55; cursor: not-allowed; }
+.btn-send:hover:not([disabled]) { background: var(--accent-strong); }
+.composer-hint {
+  font: 500 11px var(--font-mono);
+  color: var(--text-muted);
+  letter-spacing: 0.06em;
+  text-align: center;
   margin-top: 8px;
 }
 
-/* the four sections, in order */
-.section { margin-bottom: 18px; }
-.section:last-child { margin-bottom: 0; }
-.section .tag {
-  font-family: var(--mono);
-  font-size: 10px;
-  letter-spacing: 0.22em;
+.typing {
+  display: inline-flex; align-items: center; gap: 6px;
+  font: 500 13px var(--font-sans); color: var(--text-muted);
+}
+.typing-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--text-muted); animation: bounce 1.2s infinite; }
+.typing-dot:nth-child(2) { animation-delay: 0.15s; }
+.typing-dot:nth-child(3) { animation-delay: 0.3s; }
+@keyframes bounce {
+  0%, 80%, 100% { transform: translateY(0); opacity: 0.4; }
+  40% { transform: translateY(-4px); opacity: 1; }
+}
+.error {
+  border: 1px solid color-mix(in srgb, var(--danger) 40%, transparent);
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 8%, var(--surface));
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  font: 500 13px var(--font-sans);
+}
+
+.foot {
+  text-align: center;
+  font: 500 11px var(--font-mono);
+  color: var(--text-muted);
+  letter-spacing: 0.08em;
+  padding: 0 0 8px;
   text-transform: uppercase;
-  color: var(--forest-ink);
-  font-weight: 700;
-  margin-bottom: 6px;
-  display: block;
 }
-.section .text {
-  font-family: var(--serif);
-  font-size: 18px;
-  line-height: 1.55;
-  color: var(--ink);
-  margin: 0;
-}
-.section.opener .text {
-  font-style: italic;
-  color: var(--ink-soft);
-  font-size: 17px;
-  border-left: 2px solid var(--forest);
-  padding: 2px 0 2px 14px;
-}
-.section.closer .text {
-  font-weight: 600;
-}
-.section.body p { margin: 0 0 0.85em 0; }
-.section.body p:last-child { margin-bottom: 0; }
-.section.followup .text {
-  font-size: 15px;
-  color: var(--ink-mute);
-  font-style: italic;
-}
-.section .text:empty { display: none; }
-.section:has(.text:empty) { display: none; }
-
-.expl .signoff {
-  margin-top: 32px;
-  padding-top: 18px;
-  border-top: 1px solid var(--rule-soft);
-  display: flex; align-items: baseline; justify-content: space-between;
-  gap: 12px; flex-wrap: wrap;
-  font-family: var(--mono);
-  font-size: 10.5px;
-  letter-spacing: 0.18em;
-  text-transform: uppercase;
-  color: var(--ink-mute);
-}
-.expl .signoff .regen {
-  color: var(--ink-soft);
-  border-bottom: 1px dashed var(--ink-mute);
-  cursor: pointer;
-  padding: 0 0 1px 0;
-  background: transparent;
-  border-left: 0; border-right: 0; border-top: 0;
-  font: inherit; letter-spacing: inherit; text-transform: inherit;
-}
-.expl .signoff .regen:hover { color: var(--ink); border-color: var(--ink); }
-.expl .signoff .regen:disabled { opacity: 0.4; cursor: progress; }
-
-.audio-panel {
-  margin-top: 18px;
-  padding-top: 18px;
-  border-top: 1px solid var(--rule-soft);
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  flex-wrap: wrap;
-}
-.audio-panel .audio-status {
-  font-family: var(--serif);
-  font-style: italic;
-  font-size: 14px;
-  color: var(--ink-mute);
-}
-.audio-panel audio {
-  width: 100%;
-  min-width: 220px;
-  margin-top: 2px;
-}
-
-.banner {
-  font-family: var(--serif);
-  font-style: italic;
-  font-size: 16px;
-  line-height: 1.5;
-  color: var(--wax-ink);
-  border-left: 3px double var(--wax);
-  padding: 4px 0 4px 14px;
-}
-
-.colophon {
-  border-top: 1px solid var(--rule);
-  padding: 22px var(--pad-x) 28px;
-  font-family: var(--mono);
-  font-size: 10.5px;
-  letter-spacing: 0.18em;
-  text-transform: uppercase;
-  color: var(--ink-mute);
-  display: flex;
-  justify-content: space-between;
-  align-items: baseline;
-  gap: 20px;
-  flex-wrap: wrap;
-  max-width: 1280px;
-  margin: 0 auto;
-}
-.colophon a { color: var(--ink-soft); text-decoration: none; border-bottom: 1px dotted var(--ink-mute); }
-.colophon a:hover { color: var(--ink); border-color: var(--ink); }
-
-/* =========================================================================
-   REDESIGN — night observatory field guide
-   A parent is not asking for a dashboard; they are trying to find a careful
-   sentence in the dark. The interface should feel like a quiet instrument:
-   ink, brass, star maps, and one illuminated page.
-   ========================================================================= */
-
-:root {
-  --night:      #081019;
-  --night-2:    #0d1924;
-  --night-3:    #132333;
-  --mist:       #dbe3dd;
-  --mist-dim:   #aebbb7;
-  --vellum:     #f1ead7;
-  --vellum-2:   #fbf5e8;
-  --vellum-3:   #e4d8bd;
-  --ink:        #13202a;
-  --ink-soft:   #314150;
-  --ink-mute:   #67747d;
-  --rule:       rgba(210, 188, 139, 0.42);
-  --rule-soft:  rgba(210, 188, 139, 0.22);
-  --forest:     #5f8e79;
-  --forest-ink: #1d5d4f;
-  --wax:        #d46a45;
-  --wax-ink:    #8f381f;
-  --gold:       #d8b56a;
-  --bluefire:   #8cc7d8;
-  --serif:      "Literata", "Iowan Old Style", Georgia, serif;
-  --display:    "Fraunces", "Literata", Georgia, serif;
-  --mono:       "Fragment Mono", "JetBrains Mono", ui-monospace, monospace;
-  --pad-x:      clamp(18px, 4vw, 64px);
-  --ease:       cubic-bezier(0.16, 1, 0.3, 1);
-  --shadow-leaf: 0 34px 90px -48px rgba(0, 0, 0, 0.82), 0 0 0 1px rgba(216,181,106,0.14);
-}
-
-html { background: var(--night); }
-body {
-  color: var(--mist);
-  background:
-    radial-gradient(circle at 14% 16%, rgba(140,199,216,0.18) 0 12%, transparent 30%),
-    radial-gradient(circle at 86% 8%, rgba(212,106,69,0.16) 0 10%, transparent 28%),
-    radial-gradient(circle at 72% 86%, rgba(216,181,106,0.11) 0 11%, transparent 26%),
-    linear-gradient(135deg, #060b12 0%, var(--night) 38%, #101b26 100%);
-  isolation: isolate;
-}
-body::before {
-  opacity: 0.38;
-  mix-blend-mode: screen;
-  background-image:
-    radial-gradient(circle at 20px 24px, rgba(255,255,255,0.72) 0 1px, transparent 1.4px),
-    radial-gradient(circle at 82px 68px, rgba(216,181,106,0.56) 0 1px, transparent 1.4px),
-    url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='180' height='180'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.78' numOctaves='3' seed='11'/><feColorMatrix values='0 0 0 0 0.80 0 0 0 0 0.78 0 0 0 0 0.68 0 0 0 0.18 0'/></filter><rect width='100%25' height='100%25' filter='url(%23n)'/></svg>");
-  background-size: 118px 118px, 172px 172px, 180px 180px;
-}
-body::after {
-  content: "";
-  position: fixed;
-  inset: auto -8vw -18vh auto;
-  width: min(62vw, 720px);
-  height: min(62vw, 720px);
-  pointer-events: none;
-  z-index: -1;
-  opacity: 0.34;
-  border: 1px solid rgba(216,181,106,0.28);
-  border-radius: 50%;
-  background:
-    linear-gradient(90deg, transparent 49.8%, rgba(216,181,106,0.24) 50%, transparent 50.2%),
-    linear-gradient(0deg, transparent 49.8%, rgba(216,181,106,0.24) 50%, transparent 50.2%),
-    radial-gradient(circle, transparent 0 44%, rgba(216,181,106,0.2) 44.2% 44.6%, transparent 45%),
-    radial-gradient(circle, transparent 0 64%, rgba(216,181,106,0.16) 64.2% 64.6%, transparent 65%);
-  transform: rotate(-11deg);
-}
-
-.imprint {
-  position: relative;
-  padding: 18px var(--pad-x);
-  border-bottom: 1px solid rgba(216,181,106,0.2);
-  background: rgba(8,16,25,0.72);
-  color: var(--mist-dim);
-  backdrop-filter: blur(18px);
-}
-.imprint::after {
-  content: "";
-  position: absolute;
-  left: var(--pad-x);
-  right: var(--pad-x);
-  bottom: -1px;
-  height: 1px;
-  background: linear-gradient(90deg, transparent, var(--gold), transparent);
-  opacity: 0.56;
-}
-.imprint .wordmark {
-  color: var(--vellum-2);
-  font-family: var(--display);
-  font-size: clamp(20px, 2.2vw, 31px);
-  font-style: normal;
-  font-variation-settings: "SOFT" 75, "WONK" 1;
-  letter-spacing: -0.025em;
-}
-.imprint .wordmark b { color: var(--gold); font-weight: 760; }
-.imprint .meta { color: var(--mist-dim); opacity: 0.92; }
-.imprint .meta span b { color: var(--bluefire); }
-
-.stage {
-  position: relative;
-  max-width: 1380px;
-  grid-template-columns: minmax(320px, 0.92fr) minmax(420px, 1.08fr);
-  gap: clamp(28px, 5vw, 86px);
-  padding-top: clamp(34px, 6vw, 84px);
-}
-.stage::before {
-  content: "";
-  position: absolute;
-  top: 54px;
-  left: calc(var(--pad-x) + 17px);
-  width: 120px;
-  height: 120px;
-  opacity: 0.34;
-  pointer-events: none;
-  border-left: 1px solid var(--gold);
-  border-top: 1px solid var(--gold);
-  transform: rotate(-7deg);
-}
-
-.col-form {
-  top: 34px;
-  padding: clamp(22px, 3vw, 34px);
-  background: linear-gradient(180deg, rgba(13,25,36,0.82), rgba(8,16,25,0.58));
-  border: 1px solid rgba(216,181,106,0.22);
-  box-shadow: 0 28px 78px -58px rgba(0,0,0,0.86);
-  backdrop-filter: blur(16px);
-}
-.col-form::before {
-  content: "Parent console / private draft";
-  display: block;
-  margin-bottom: 18px;
-  font-family: var(--mono);
-  font-size: 10px;
-  letter-spacing: 0.2em;
-  text-transform: uppercase;
-  color: var(--gold);
-}
-.title-block { margin-bottom: 30px; }
-.title-block h1 {
-  color: var(--vellum-2);
-  font-family: var(--display);
-  font-size: clamp(48px, 6.8vw, 88px);
-  line-height: 0.86;
-  letter-spacing: -0.055em;
-  font-weight: 820;
-  font-variation-settings: "SOFT" 64, "WONK" 1;
-  max-width: 8.4ch;
-}
-.title-block h1 em {
-  color: var(--bluefire);
-  font-style: italic;
-  font-weight: 430;
-}
-.title-block .lede {
-  color: var(--mist-dim);
-  font-size: 16px;
-  max-width: 45ch;
-}
-form { gap: 20px; }
-.label {
-  color: rgba(216,181,106,0.9);
-  font-size: 9.5px;
-}
-.label small, .hint { color: rgba(219,227,221,0.56); }
-input[type="text"], textarea {
-  color: var(--vellum-2);
-  background: rgba(5,10,16,0.42);
-  border: 1px solid rgba(216,181,106,0.28);
-  box-shadow: inset 0 0 0 1px rgba(255,255,255,0.025);
-  border-radius: 18px 18px 18px 4px;
-  padding: 14px 16px;
-}
-textarea { min-height: 138px; }
-input[type="text"]::placeholder, textarea::placeholder { color: rgba(219,227,221,0.42); }
-input[type="text"]:focus, textarea:focus {
-  border-color: var(--bluefire);
-  background: rgba(12,28,40,0.62);
-  box-shadow: 0 0 0 4px rgba(140,199,216,0.1), inset 0 0 0 1px rgba(255,255,255,0.04);
-}
-.age .readout { color: var(--vellum-2); font-family: var(--display); font-size: 38px; }
-.age .readout small { color: var(--mist-dim); }
-.age input[type="range"] { height: 2px; background: rgba(216,181,106,0.34); }
-.age input[type="range"]::-webkit-slider-thumb {
-  background: var(--bluefire);
-  border-color: var(--night);
-  box-shadow: 0 0 0 1px var(--bluefire), 0 0 24px rgba(140,199,216,0.52);
-}
-.age input[type="range"]::-moz-range-thumb {
-  background: var(--bluefire);
-  border-color: var(--night);
-  box-shadow: 0 0 0 1px var(--bluefire), 0 0 24px rgba(140,199,216,0.52);
-}
-.tone-row {
-  border-color: rgba(216,181,106,0.28);
-  border-radius: 999px;
-  padding: 4px;
-  gap: 4px;
-  background: rgba(5,10,16,0.46);
-}
-.tone-row label {
-  border: 0;
-  border-radius: 999px;
-  color: var(--mist-dim);
-  padding: 10px 8px;
-}
-.tone-row label.is-on {
-  background: var(--vellum);
-  color: var(--night);
-  box-shadow: 0 7px 24px -14px rgba(251,245,232,0.85);
-}
-.examples { gap: 8px; }
-.ex-chip {
-  position: relative;
-  overflow: hidden;
-  color: rgba(241,234,215,0.86);
-  background: linear-gradient(90deg, rgba(19,35,51,0.7), rgba(8,16,25,0.34));
-  border-color: rgba(216,181,106,0.16);
-  border-radius: 16px 16px 16px 4px;
-  padding: 10px 13px 10px 16px;
-}
-.ex-chip::before {
-  content: "";
-  position: absolute;
-  left: 0;
-  top: 12px;
-  bottom: 12px;
-  width: 2px;
-  background: var(--gold);
-  opacity: 0.6;
-}
-.ex-chip:hover {
-  color: var(--vellum-2);
-  background: rgba(19,35,51,0.92);
-  border-color: rgba(140,199,216,0.42);
-  transform: translateX(2px);
-}
-.ex-chip small { color: var(--bluefire); }
-
-.btn-primary {
-  color: #10161d;
-  background: linear-gradient(135deg, var(--gold), #f0d99c 48%, #d37a52);
-  border: 0;
-  border-radius: 999px;
-  padding: 14px 22px;
-  box-shadow: 0 15px 36px -22px rgba(216,181,106,0.98), inset 0 1px 0 rgba(255,255,255,0.52);
-  font-family: var(--display);
-  font-weight: 760;
-}
-.btn-primary:hover { background: linear-gradient(135deg, #f1cf77, #fff0bd 48%, #e07b51); }
-.btn-primary:disabled { background: rgba(174,187,183,0.42); color: rgba(8,16,25,0.72); }
-.btn-ghost, .seed-pill { color: var(--mist-dim); }
-.btn-ghost:hover { color: var(--bluefire); border-color: var(--bluefire); }
-
-.col-story { min-height: 66vh; }
-.book {
-  color: var(--ink);
-  background:
-    linear-gradient(115deg, rgba(255,255,255,0.5), transparent 34%),
-    radial-gradient(circle at 92% 8%, rgba(216,181,106,0.2), transparent 26%),
-    linear-gradient(180deg, var(--vellum-2), var(--vellum));
-  border: 1px solid rgba(255,255,255,0.58);
-  border-radius: 34px 34px 34px 8px;
-  box-shadow: var(--shadow-leaf);
-  padding: clamp(34px, 5vw, 68px) clamp(26px, 4.8vw, 64px);
-  transform: rotate(0.6deg);
-}
-.book::before {
-  left: 20px;
-  top: 20px;
-  right: 20px;
-  bottom: 20px;
-  border: 1px solid rgba(143,56,31,0.13);
-  border-radius: 24px 24px 24px 5px;
-}
-.book::after {
-  content: "";
-  position: absolute;
-  inset: 0;
-  pointer-events: none;
-  border-radius: inherit;
-  opacity: 0.28;
-  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='130' height='130'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' seed='8'/><feColorMatrix values='0 0 0 0 0.44 0 0 0 0 0.32 0 0 0 0 0.18 0 0 0 0.12 0'/></filter><rect width='100%25' height='100%25' filter='url(%23n)'/></svg>");
-}
-.book .corner { color: rgba(143,56,31,0.46); width: 26px; height: 26px; }
-.book .corner.tl { top: 14px; left: 14px; }
-.book .corner.tr { top: 14px; right: 14px; }
-.book .corner.bl { bottom: 14px; left: 14px; }
-.book .corner.br { bottom: 14px; right: 14px; }
-.cover { min-height: 430px; }
-.cover .folio, .expl .byline, .section .tag, .expl .signoff { color: rgba(19,32,42,0.58); }
-.cover h2 {
-  font-family: var(--display);
-  color: var(--ink);
-  font-size: clamp(42px, 5.1vw, 72px);
-  line-height: 0.9;
-  letter-spacing: -0.05em;
-  font-style: normal;
-  font-weight: 780;
-  font-variation-settings: "SOFT" 76, "WONK" 1;
-}
-.cover h2 b { color: var(--wax-ink); }
-.cover p { color: var(--ink-soft); font-size: 17px; max-width: 47ch; }
-.writing { min-height: 430px; }
-.writing .penline { color: var(--wax-ink); }
-.writing .quill { background: var(--wax-ink); }
-.writing .progress {
-  height: 5px;
-  border-radius: 999px;
-  background: linear-gradient(90deg, var(--wax) 0%, var(--gold) var(--p,40%), rgba(19,32,42,0.12) var(--p,40%), rgba(19,32,42,0.12) 100%);
-}
-.writing p { color: var(--ink-soft); }
-.expl { animation: arrive 0.7s var(--ease) both; }
-@keyframes arrive { from { opacity: 0; transform: translateY(12px) rotate(-0.8deg); filter: blur(6px); } to { opacity: 1; transform: translateY(0) rotate(0); filter: blur(0); } }
-.expl h2.title {
-  color: var(--ink);
-  font-family: var(--display);
-  font-size: clamp(36px, 4.4vw, 58px);
-  line-height: 0.94;
-  letter-spacing: -0.045em;
-  font-weight: 780;
-  font-variation-settings: "SOFT" 70, "WONK" 1;
-}
-.expl h2.title small { color: rgba(19,32,42,0.52); }
-.section { margin-bottom: 22px; }
-.section .tag { color: var(--wax-ink); }
-.section .text { color: var(--ink); font-size: 18.5px; }
-.section.opener .text {
-  color: #243545;
-  background: rgba(255,255,255,0.34);
-  border-left: 0;
-  border-radius: 18px 18px 18px 4px;
-  padding: 14px 16px;
-  box-shadow: inset 0 0 0 1px rgba(143,56,31,0.09);
-}
-.section.closer .text { color: var(--wax-ink); }
-.section.followup .text { color: rgba(19,32,42,0.62); }
-.audio-panel {
-  border-top-color: rgba(143,56,31,0.14);
-  background: rgba(255,255,255,0.25);
-  border-radius: 20px 20px 20px 6px;
-  padding: 16px;
-}
-.btn-read {
-  color: var(--vellum-2);
-  background: var(--night-2);
-  border: 1px solid rgba(19,32,42,0.88);
-  border-radius: 999px;
-  padding: 10px 14px;
-}
-.btn-read:hover { background: var(--wax-ink); color: var(--vellum-2); border-color: var(--wax-ink); }
-.audio-panel .audio-status { color: rgba(19,32,42,0.62); }
-.audio-panel audio { filter: sepia(0.18) saturate(0.8); }
-.banner { color: var(--wax-ink); border-left-color: var(--wax); }
-.colophon {
-  border-top-color: rgba(216,181,106,0.16);
-  color: rgba(219,227,221,0.54);
-}
-.colophon b { color: var(--gold) !important; }
-.colophon a { color: var(--bluefire); border-bottom-color: rgba(140,199,216,0.42); }
-.colophon a:hover { color: var(--vellum-2); border-color: var(--vellum-2); }
-
-@media (max-width: 980px) {
-  .imprint { align-items: flex-start; flex-direction: column; }
-  .imprint .meta { flex-wrap: wrap; gap: 10px 18px; }
-  .stage { grid-template-columns: 1fr; }
-  .col-form { position: static; }
-  .book { transform: none; }
-}
-
-@media (max-width: 560px) {
-  .col-form { padding: 20px; }
-  .title-block h1 { max-width: 9ch; }
-  .tone-row { grid-template-columns: 1fr; border-radius: 22px; }
-  .book { border-radius: 24px 24px 24px 6px; }
-}
+.foot a { color: var(--text-muted); text-decoration: none; border-bottom: 1px dotted var(--line); }
+.foot a:hover { color: var(--text); }
 </style>
 </head>
 <body>
 
-<header class="imprint" role="banner">
-  <div class="wordmark"><b>Fabella</b> &mdash; a quiet instrument for hard questions</div>
-  <div class="meta">
-    <span><b>Track I</b> &middot; Backyard AI</span>
-    <span>Gemma <b>4B</b> &middot; Nemotron <b>4B</b> &middot; VoxCPM2 &middot; Modal</span>
+<header class="appbar" role="banner">
+  <div class="brand">
+    <span class="brand-dot" aria-hidden="true"></span>
+    <span>Fabella <small>small words for big questions</small></span>
+  </div>
+  <div class="appbar-actions">
+    <button type="button" class="chip" id="age-chip"><span class="chip-dot" aria-hidden="true"></span>Age <span id="age-chip-val">7</span></button>
+    <button type="button" class="chip" id="tone-chip"><span class="chip-dot" aria-hidden="true"></span>Tone <span id="tone-chip-val">gentle</span></button>
+    <button type="button" class="btn-ghost" id="open-settings">Settings</button>
+    <button type="button" class="btn-ghost" id="clear-history">Clear</button>
   </div>
 </header>
 
-<main class="stage" role="main">
+<main id="thread" class="thread" aria-live="polite"></main>
 
-  <section class="col-form" aria-label="The situation">
-    <div class="title-block">
-      <h1>What's the <em>hard thing</em>?</h1>
-      <p class="lede">Tell Fabella the situation in a sentence or two. She drafts a small, careful script, has another model check it, then can read it back in a calm voice.</p>
+<section class="composer" aria-label="Composer">
+  <form id="composer" class="composer-inner" novalidate>
+    <textarea id="input" rows="1" placeholder="Describe the hard situation. A sentence or two is enough." maxlength="800" required></textarea>
+    <div class="composer-controls">
+      <button type="submit" class="btn-send" id="send-btn"><span id="send-label">Draft</span><span aria-hidden="true">&rarr;</span></button>
     </div>
+  </form>
+  <div class="composer-hint">Fabella checks every draft against a six-criterion rubric. Read-aloud uses VoxCPM2 on demand.</div>
+</section>
 
-    <form id="explain-form" novalidate>
-      <div class="field">
-        <label class="label" for="situation">The situation</label>
-        <textarea id="situation" name="situation" placeholder="e.g. My 7-year-old's grandma is in the hospital for surgery. She keeps asking why grandma won't come home." maxlength="600" required></textarea>
-        <div class="hint">A sentence or two is enough. The more concrete, the better the explanation.</div>
-      </div>
+<dialog id="settings" style="border:1px solid var(--line); border-radius: var(--radius); padding: 0; max-width: 480px; width: calc(100% - 32px); background: var(--surface); color: var(--text);">
+  <form method="dialog" style="padding: 22px;">
+    <h2 style="margin: 0 0 12px; font-size: 18px;">Settings</h2>
+    <label style="display:block; font: 500 12px var(--font-mono); color: var(--text-muted); margin: 12px 0 6px; letter-spacing: 0.06em; text-transform: uppercase;">Child's age</label>
+    <input id="age-range" type="range" min="5" max="12" step="1" value="7" style="width:100%;">
+    <div style="font: 500 12px var(--font-sans); color: var(--text-soft); margin-top: 4px;"><span id="age-readout">7</span> years</div>
+    <label style="display:block; font: 500 12px var(--font-mono); color: var(--text-muted); margin: 16px 0 6px; letter-spacing: 0.06em; text-transform: uppercase;">Child's name (optional)</label>
+    <input id="child-name" type="text" maxlength="30" placeholder="leave empty to address the parent" style="width:100%; padding: 10px 12px; border:1px solid var(--line); border-radius: 10px; background: var(--bg); color: var(--text); font: 400 14px var(--font-sans);">
+    <label style="display:block; font: 500 12px var(--font-mono); color: var(--text-muted); margin: 16px 0 6px; letter-spacing: 0.06em; text-transform: uppercase;">Tone</label>
+    <div id="tone-row" style="display:grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px;"></div>
+    <div style="display:flex; gap: 8px; justify-content: flex-end; margin-top: 18px;">
+      <button type="button" class="btn-ghost" id="settings-cancel">Close</button>
+      <button type="submit" class="btn-send" style="padding: 8px 14px;">Save</button>
+    </div>
+  </form>
+</dialog>
 
-      <div class="field">
-        <span class="label">Or start from an example</span>
-        <div class="examples" id="examples"></div>
-      </div>
-
-      <div class="field">
-        <label class="label" for="age-range">The child's age</label>
-        <div class="age">
-          <input id="age-range" name="age" type="range" min="5" max="12" step="1" value="7" />
-          <div class="readout"><span id="age-readout">7</span><small>years</small></div>
-        </div>
-      </div>
-
-      <div class="field">
-        <label class="label" for="child-name">Child's name <small>(optional)</small></label>
-        <input id="child-name" name="child_name" type="text" placeholder="leave empty to address the parent" maxlength="30" autocomplete="off" />
-      </div>
-
-      <div class="field">
-        <span class="label">Tone</span>
-        <div class="tone-row" id="tone-row" role="radiogroup" aria-label="Tone"></div>
-      </div>
-
-      <div class="actions">
-        <button type="submit" id="submit-btn" class="btn-primary">
-          <span id="submit-label">Draft an explanation</span>
-          <span class="arrow" aria-hidden="true">&rarr;</span>
-        </button>
-        <button type="button" id="regen-btn" class="btn-ghost" disabled>New version</button>
-        <span class="seed-pill" id="seed-pill">N&deg;&nbsp;0</span>
-      </div>
-    </form>
-  </section>
-
-  <section class="col-story" aria-label="The explanation">
-    <article class="book" id="book">
-      <svg class="corner tl" viewBox="0 0 22 22" fill="none" stroke="currentColor" stroke-width="1"><path d="M2 8 L2 2 L8 2 M2 4 Q10 4 10 10"/></svg>
-      <svg class="corner tr" viewBox="0 0 22 22" fill="none" stroke="currentColor" stroke-width="1"><path d="M2 8 L2 2 L8 2 M2 4 Q10 4 10 10"/></svg>
-      <svg class="corner bl" viewBox="0 0 22 22" fill="none" stroke="currentColor" stroke-width="1"><path d="M2 8 L2 2 L8 2 M2 4 Q10 4 10 10"/></svg>
-      <svg class="corner br" viewBox="0 0 22 22" fill="none" stroke="currentColor" stroke-width="1"><path d="M2 8 L2 2 L8 2 M2 4 Q10 4 10 10"/></svg>
-
-      <div class="inner" id="page">
-        <div class="cover" id="cover">
-          <div class="folio">Night folio &middot; private draft</div>
-          <h2>Put the hard thing on the table.<br/><b>Leave with words.</b></h2>
-          <p>Fill in the situation on the left. Fabella writes the first careful version, checks it against a child-language rubric, and keeps VoxCPM2 ready if you want to hear it aloud.</p>
-        </div>
-      </div>
-    </article>
-  </section>
-
-</main>
-
-<footer class="colophon">
-  <span>Set in <b>Fraunces</b> and <b>Literata</b> &middot; Spoken by VoxCPM2 on demand</span>
-  <span>Built for the <a href="https://huggingface.co/spaces/build-small-hackathon/README" target="_blank" rel="noopener">Build Small Hackathon</a> &middot; 2026</span>
+<footer class="foot">
+  Built for the <a href="https://huggingface.co/spaces/build-small-hackathon/README" target="_blank" rel="noopener">Build Small Hackathon</a>
 </footer>
 
 <script>
 (function () {
   "use strict";
 
-  const TONE_CHOICES = __TONE_CHOICES__;
-  const EXAMPLES = __EXAMPLES__;
-  const SECTION_SEP = "\x1f";
+  var TONE_CHOICES = __TONE_CHOICES__;
+  var EXAMPLES = __EXAMPLES__;
+  var SECTION_SEP = "\x1f";
+  var SESSION_KEY = "fabella_session_id";
 
-  // example chips
-  const exEl = document.getElementById("examples");
-  EXAMPLES.forEach((s, i) => {
-    const b = document.createElement("button");
-    b.type = "button";
-    b.className = "ex-chip";
-    b.innerHTML = "<small>Example " + (i + 1) + "</small>" + escapeHTML(s);
-    b.addEventListener("click", () => {
-      document.getElementById("situation").value = s;
-      document.getElementById("situation").focus();
-    });
-    exEl.appendChild(b);
-  });
+  var sessionId = (function () {
+    try {
+      var existing = localStorage.getItem(SESSION_KEY);
+      if (!existing) {
+        existing = (crypto && crypto.randomUUID) ? crypto.randomUUID() : String(Date.now()) + "-" + Math.random().toString(16).slice(2);
+        localStorage.setItem(SESSION_KEY, existing);
+      }
+      return existing;
+    } catch (_) {
+      return String(Date.now()) + "-" + Math.random().toString(16).slice(2);
+    }
+  })();
 
-  // tone
-  const toneRow = document.getElementById("tone-row");
-  TONE_CHOICES.forEach(([val, label], i) => {
-    const lbl = document.createElement("label");
-    lbl.textContent = label;
-    const input = document.createElement("input");
-    input.type = "radio"; input.name = "tone"; input.value = val; input.checked = (i === 0);
-    lbl.appendChild(input);
-    lbl.className = input.checked ? "is-on" : "";
-    lbl.addEventListener("click", () => {
-      toneRow.querySelectorAll("label").forEach(x => x.classList.remove("is-on"));
-      lbl.classList.add("is-on");
-      input.checked = true;
-    });
-    toneRow.appendChild(lbl);
-  });
+  var thread = document.getElementById("thread");
+  var input = document.getElementById("input");
+  var sendBtn = document.getElementById("send-btn");
+  var sendLabel = document.getElementById("send-label");
+  var ageChip = document.getElementById("age-chip");
+  var ageChipVal = document.getElementById("age-chip-val");
+  var toneChip = document.getElementById("tone-chip");
+  var toneChipVal = document.getElementById("tone-chip-val");
+  var clearBtn = document.getElementById("clear-history");
 
-  // age
-  const ageRange = document.getElementById("age-range");
-  const ageReadout = document.getElementById("age-readout");
-  ageRange.addEventListener("input", () => { ageReadout.textContent = ageRange.value; });
+  var dlg = document.getElementById("settings");
+  var ageRange = document.getElementById("age-range");
+  var ageReadout = document.getElementById("age-readout");
+  var childName = document.getElementById("child-name");
+  var toneRow = document.getElementById("tone-row");
+  var settingsCancel = document.getElementById("settings-cancel");
+  var openSettings = document.getElementById("open-settings");
 
-  // form
-  const form = document.getElementById("explain-form");
-  const submitBtn = document.getElementById("submit-btn");
-  const submitLabel = document.getElementById("submit-label");
-  const regenBtn = document.getElementById("regen-btn");
-  const page = document.getElementById("page");
-  const seedPill = document.getElementById("seed-pill");
-  let seed = 0;
-  let lastResult = null;
-  let lastAudioText = "";
-
-  function setBusy(busy) {
-    submitBtn.disabled = busy;
-    regenBtn.disabled = busy || !lastResult;
-    submitLabel.textContent = busy
-      ? "Composing…"
-      : (lastResult ? "Draft another" : "Draft an explanation");
-  }
-
-  function renderWriting() {
-    page.innerHTML =
-      '<div class="writing">' +
-        '<div class="penline"><span class="quill" aria-hidden="true"></span><span>Drafting, with care</span></div>' +
-        '<div class="progress" id="progress" style="--p:8%"></div>' +
-        '<p>Fabella is drafting, then a second small model is checking the explanation against a six-criterion rubric (clarity, age, warmth, no moralizing, no scary content, concrete).</p>' +
-      '</div>';
-    let p = 8;
-    const tick = setInterval(() => {
-      p = Math.min(p + 4 + Math.random() * 6, 88);
-      const el = document.getElementById("progress");
-      if (el) el.style.setProperty("--p", p + "%");
-      else clearInterval(tick);
-    }, 320);
-    return () => clearInterval(tick);
-  }
+  var currentAge = 7;
+  var currentTone = "gentle";
+  var childNameValue = "";
 
   function escapeHTML(s) {
-    return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+    return String(s).replace(/[&<>"']/g, function (c) { return ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[c]; });
   }
 
-  function renderExplanation(sections) {
-    const opener = sections[0] || "";
-    const body = sections[1] || "";
-    const closer = sections[2] || "";
-    const followup = sections[3] || "";
-    lastAudioText = [opener, body, closer, followup].filter(Boolean).join("\n\n");
-    const childName = (document.getElementById("child-name").value || "").trim();
-    const toneLabel = (document.querySelector('#tone-row input:checked') || {}).value || "gentle";
-    const ageStr = ageRange.value;
-    const dateStr = new Date().toLocaleDateString(undefined, {year:"numeric",month:"short",day:"numeric"});
+  function autosize() {
+    input.style.height = "auto";
+    input.style.height = Math.min(input.scrollHeight, 200) + "px";
+  }
+  input.addEventListener("input", autosize);
 
-    const openerHTML = opener
-      ? '<section class="section opener"><span class="tag">Opener — say this first</span><p class="text">' + escapeHTML(opener) + '</p></section>'
-      : "";
-    const bodyHTML = body
-      ? '<section class="section body"><span class="tag">The explanation — read this aloud</span><div class="text">' +
-          body.split(/\n\s*\n/).filter(Boolean).map(p => '<p>' + escapeHTML(p.trim()).replace(/\n/g, "<br/>") + '</p>').join("") +
-        '</div></section>'
-      : "";
-    const closerHTML = closer
-      ? '<section class="section closer"><span class="tag">Closer — say this to land it</span><p class="text">' + escapeHTML(closer) + '</p></section>'
-      : "";
-    const followupHTML = followup
-      ? '<section class="section followup"><span class="tag">If they ask another question</span><p class="text">' + escapeHTML(followup) + '</p></section>'
-      : "";
-
-    page.innerHTML =
-      '<div class="expl">' +
-        '<div class="byline">' +
-          '<span>Folio I</span><span class="dot" aria-hidden="true"></span>' +
-          '<span>For a ' + escapeHTML(ageStr) + '-year-old' + (childName ? ' named ' + escapeHTML(childName) : '') + '</span>' +
-          '<span class="dot" aria-hidden="true"></span>' +
-          '<span>' + escapeHTML(toneLabel) + '</span>' +
-        '</div>' +
-        '<h2 class="title">A short explanation<small>Read aloud &middot; revise if you want</small></h2>' +
-        openerHTML + bodyHTML + closerHTML + followupHTML +
-        '<div class="audio-panel" id="audio-panel">' +
-          '<button type="button" class="btn-read" id="read-aloud">Read aloud</button>' +
-          '<span class="audio-status" id="audio-status">VoxCPM2 narration runs only when you ask for it.</span>' +
-          '<audio id="audio-player" controls hidden></audio>' +
-        '</div>' +
-        '<div class="signoff">' +
-          '<span>End of folio &middot; ' + dateStr + '</span>' +
-          '<button type="button" class="regen" id="regen-inline">New version &rarr;</button>' +
-        '</div>' +
-      '</div>';
-    const ri = document.getElementById("regen-inline");
-    if (ri) ri.addEventListener("click", () => regenBtn.click());
-    const readBtn = document.getElementById("read-aloud");
-    if (readBtn) readBtn.addEventListener("click", readAloud);
+  function syncChips() {
+    ageChipVal.textContent = String(currentAge);
+    toneChipVal.textContent = currentTone;
   }
 
-  function renderError(msg) {
-    page.innerHTML =
-      '<div class="expl">' +
-        '<div class="byline"><span>Folio I</span><span class="dot" aria-hidden="true"></span><span>Hold on a moment</span></div>' +
-        '<div class="banner">' + escapeHTML(msg) + '</div>' +
-      '</div>';
-  }
-
-  async function callMakeExplanation(useSeed) {
-    const data = {
-      situation: document.getElementById("situation").value,
-      age: parseInt(ageRange.value, 10),
-      child_name: document.getElementById("child-name").value,
-      tone: (document.querySelector('#tone-row input:checked') || {}).value || "gentle",
-      seed: useSeed,
-    };
-    const res = await fetch("/gradio_api/call/make_explanation", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ data: [data.situation, data.age, data.child_name, data.tone, data.seed] }),
+  function buildTones() {
+    toneRow.innerHTML = "";
+    TONE_CHOICES.forEach(function (pair) {
+      var val = pair[0];
+      var label = pair[1];
+      var id = "tone-" + val;
+      var wrap = document.createElement("label");
+      wrap.htmlFor = id;
+      wrap.style.cssText = "display:flex; align-items:center; justify-content:center; padding:10px; border:1px solid var(--line); border-radius: 10px; cursor:pointer; font: 500 13px var(--font-sans); color: var(--text-soft); background: var(--bg);";
+      wrap.dataset.tone = val;
+      var r = document.createElement("input");
+      r.type = "radio"; r.name = "tone"; r.id = id; r.value = val; r.style.display = "none";
+      r.checked = (val === currentTone);
+      if (r.checked) wrap.style.cssText += " border-color: var(--accent); color: var(--accent-strong); background: var(--accent-soft);";
+      r.addEventListener("change", function () {
+        Array.from(toneRow.children).forEach(function (c) { c.style.cssText = "display:flex; align-items:center; justify-content:center; padding:10px; border:1px solid var(--line); border-radius: 10px; cursor:pointer; font: 500 13px var(--font-sans); color: var(--text-soft); background: var(--bg);"; });
+        wrap.style.cssText += " border-color: var(--accent); color: var(--accent-strong); background: var(--accent-soft);";
+        currentTone = val;
+        syncChips();
+      });
+      wrap.appendChild(r);
+      wrap.appendChild(document.createTextNode(label));
+      toneRow.appendChild(wrap);
     });
-    if (!res.ok) {
-      const t = await res.text();
-      throw new Error("HTTP " + res.status + ": " + t.slice(0, 200));
+  }
+
+  function welcomeOrThread(messages) {
+    thread.innerHTML = "";
+    if (!messages || !messages.length) {
+      var w = document.createElement("section");
+      w.className = "welcome";
+      w.innerHTML =
+        '<h1>Tell me the <em>hard thing</em>.</h1>' +
+        '<p>Fabella drafts a short, kind, age-appropriate explanation. A second small model checks it. You can read it aloud with one tap.</p>' +
+        '<div class="examples" id="examples"></div>';
+      thread.appendChild(w);
+      var ex = document.getElementById("examples");
+      EXAMPLES.forEach(function (s) {
+        var b = document.createElement("button");
+        b.type = "button";
+        b.className = "example-btn";
+        b.textContent = s;
+        b.addEventListener("click", function () {
+          input.value = s;
+          autosize();
+          input.focus();
+        });
+        ex.appendChild(b);
+      });
+      return;
     }
-    const evt0 = await res.json();
-    const eventId = evt0.event_id;
-    const evt = await fetch("/gradio_api/call/make_explanation/" + eventId, { headers: { Accept: "text/event-stream" } });
-    if (!evt.ok || !evt.body) throw new Error("SSE open failed");
-    const reader = evt.body.getReader();
-    const dec = new TextDecoder();
-    let buf = "";
-    let result = null;
-    let err = null;
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buf += dec.decode(value, { stream: true });
-      let idx;
-      while ((idx = buf.indexOf("\n\n")) !== -1) {
-        const frame = buf.slice(0, idx);
-        buf = buf.slice(idx + 2);
-        const line = frame.split("\n").find(l => l.startsWith("data: "));
-        if (!line) continue;
-        const payload = line.slice(6).trim();
-        if (payload === "null" || payload === "") continue;
-        try {
-          const obj = JSON.parse(payload);
-          if (obj.msg === "process_completed") {
-            if (obj.success) {
-              const out = obj.output && obj.output.data;
-              let text = null;
-              if (Array.isArray(out)) text = out.find(v => typeof v === "string");
-              else if (typeof out === "string") text = out;
-              if (text) {
-                // 4 sections joined by U+001F
-                result = text.split(SECTION_SEP);
-                if (result.length < 4) {
-                  while (result.length < 4) result.push("");
-                }
-              }
-            } else {
-              err = (obj.output && obj.output.error) || "Generation failed";
-            }
-          }
-        } catch (_) {}
+    messages.forEach(function (m) {
+      if (m.role === "parent") {
+        thread.appendChild(renderUserTurn(m.content));
+      } else {
+        thread.appendChild(renderFabellaTurn(m.content, null));
       }
+    });
+  }
+
+  function renderUserTurn(text) {
+    var wrap = document.createElement("article");
+    wrap.className = "turn user";
+    wrap.innerHTML =
+      '<div class="avatar user" aria-hidden="true">You</div>' +
+      '<div class="bubble"><div class="text">' + escapeHTML(text).replace(/\n/g, "<br>") + '</div></div>';
+    return wrap;
+  }
+
+  function parseFabellaText(text) {
+    var out = [];
+    var re = /(Opener|Body|Closer|If they ask more):\s*([\s\S]*?)(?=(?:\n\s*\n)(?:Opener|Body|Closer|If they ask more):|$)/g;
+    var m;
+    while ((m = re.exec(text)) !== null) {
+      out.push({ label: m[1], text: m[2].trim() });
     }
-    if (err) throw new Error(err);
-    if (!result) throw new Error("No result");
-    return result;
+    return out;
+  }
+
+  function renderFabellaTurn(rawText, audioUrl) {
+    var wrap = document.createElement("article");
+    wrap.className = "turn fabella";
+    var sections = parseFabellaText(rawText);
+    var sectionsHTML = sections.length
+      ? sections.map(function (s) { return '<div class="section-label">' + escapeHTML(s.label) + '</div><div class="section-text">' + escapeHTML(s.text) + '</div>'; }).join("")
+      : '<div class="section-text">' + escapeHTML(rawText) + '</div>';
+    wrap.innerHTML =
+      '<div class="avatar fabella" aria-hidden="true">F</div>' +
+      '<div class="bubble">' + sectionsHTML +
+        '<div class="turn-actions">' +
+          '<button type="button" class="btn-read" data-action="read"><span class="dot"></span>Read aloud</button>' +
+          '<button type="button" class="btn-read" data-action="copy" style="border-color: var(--line); color: var(--text-soft);">Copy</button>' +
+        '</div>' +
+        '<audio class="audio-inline" controls></audio>' +
+        '<div class="audio-status" data-status></div>' +
+      '</div>';
+    var readBtn = wrap.querySelector('[data-action="read"]');
+    var copyBtn = wrap.querySelector('[data-action="copy"]');
+    var audio = wrap.querySelector("audio.audio-inline");
+    var status = wrap.querySelector("[data-status]");
+    if (audioUrl) {
+      audio.src = audioUrl;
+      audio.classList.add("is-on");
+    }
+    readBtn.addEventListener("click", async function () {
+      if (readBtn.dataset.busy === "1") return;
+      readBtn.dataset.busy = "1";
+      readBtn.disabled = true;
+      status.textContent = "Warming VoxCPM2 and preparing narration...";
+      try {
+        var url = await readGradioString("make_audio", [rawText, currentTone]);
+        if (url.startsWith("ERROR:")) throw new Error(url.slice(6).trim());
+        audio.src = url;
+        audio.classList.add("is-on");
+        status.textContent = "Ready. Press play.";
+        await audio.play().catch(function () {});
+      } catch (err) {
+        status.textContent = String(err.message || err);
+      } finally {
+        readBtn.disabled = false;
+        readBtn.dataset.busy = "0";
+      }
+    });
+    copyBtn.addEventListener("click", async function () {
+      try {
+        await navigator.clipboard.writeText(rawText);
+        status.textContent = "Copied to clipboard.";
+      } catch (err) {
+        status.textContent = "Copy failed.";
+      }
+    });
+    return wrap;
+  }
+
+  function renderTyping() {
+    var wrap = document.createElement("article");
+    wrap.className = "turn fabella";
+    wrap.dataset.role = "typing";
+    wrap.innerHTML =
+      '<div class="avatar fabella" aria-hidden="true">F</div>' +
+      '<div class="bubble"><div class="typing"><span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span><span style="margin-left:6px;">Fabella is drafting, then checking.</span></div></div>';
+    return wrap;
+  }
+
+  function renderError(text) {
+    var wrap = document.createElement("article");
+    wrap.className = "turn fabella";
+    wrap.innerHTML =
+      '<div class="avatar fabella" aria-hidden="true">F</div>' +
+      '<div class="bubble"><div class="error">' + escapeHTML(text) + '</div></div>';
+    return wrap;
+  }
+
+  function scrollToEnd() {
+    window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
+  }
+
+  function setBusy(busy) {
+    sendBtn.disabled = busy;
+    input.disabled = busy;
+    sendLabel.textContent = busy ? "Drafting..." : "Draft";
+  }
+
+  function _extractSseText(obj) {
+    if (obj == null) return null;
+    if (Array.isArray(obj)) return obj.find(function (v) { return typeof v === "string"; }) || null;
+    if (obj.msg === "process_completed" && obj.success) {
+      var out = obj.output && obj.output.data;
+      if (Array.isArray(out)) return out.find(function (v) { return typeof v === "string"; }) || null;
+      if (typeof out === "string") return out;
+    }
+    return null;
   }
 
   async function readGradioString(apiName, data) {
-    const res = await fetch("/gradio_api/call/" + apiName, {
+    var res = await fetch("/gradio_api/call/" + apiName, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ data: data }),
     });
     if (!res.ok) {
-      const t = await res.text();
+      var t = await res.text();
       throw new Error("HTTP " + res.status + ": " + t.slice(0, 200));
     }
-    const evt0 = await res.json();
-    const eventId = evt0.event_id;
-    const evt = await fetch("/gradio_api/call/" + apiName + "/" + eventId, { headers: { Accept: "text/event-stream" } });
+    var evt0 = await res.json();
+    var eventId = evt0.event_id;
+    var evt = await fetch("/gradio_api/call/" + apiName + "/" + eventId, { headers: { Accept: "text/event-stream" } });
     if (!evt.ok || !evt.body) throw new Error("SSE open failed");
-    const reader = evt.body.getReader();
-    const dec = new TextDecoder();
-    let buf = "";
-    let result = null;
-    let err = null;
+    var reader = evt.body.getReader();
+    var dec = new TextDecoder();
+    var buf = "";
+    var result = null;
+    var err = null;
     while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buf += dec.decode(value, { stream: true });
-      let idx;
+      var r = await reader.read();
+      if (r.done) break;
+      buf += dec.decode(r.value, { stream: true });
+      var idx;
       while ((idx = buf.indexOf("\n\n")) !== -1) {
-        const frame = buf.slice(0, idx);
+        var frame = buf.slice(0, idx);
         buf = buf.slice(idx + 2);
-        const line = frame.split("\n").find(l => l.startsWith("data: "));
+        var lines = frame.split("\n");
+        var line = null;
+        for (var li = 0; li < lines.length; li++) { if (lines[li].startsWith("data: ")) { line = lines[li]; break; } }
         if (!line) continue;
-        const payload = line.slice(6).trim();
+        var payload = line.slice(6).trim();
         if (payload === "null" || payload === "") continue;
         try {
-          const obj = JSON.parse(payload);
-          if (obj.msg === "process_completed") {
-            if (obj.success) {
-              const out = obj.output && obj.output.data;
-              if (Array.isArray(out)) result = out.find(v => typeof v === "string") || null;
-              else if (typeof out === "string") result = out;
-            } else {
-              err = (obj.output && obj.output.error) || "Request failed";
-            }
+          var obj = JSON.parse(payload);
+          var text = _extractSseText(obj);
+          if (text) { result = text; break; }
+          if (obj && obj.msg === "process_completed" && obj.success === false) {
+            err = (obj.output && obj.output.error) || "Request failed";
+            break;
           }
         } catch (_) {}
       }
+      if (result !== null || err) break;
     }
     if (err) throw new Error(err);
     if (!result) throw new Error("No result");
     return result;
   }
 
-  async function readAloud() {
-    const btn = document.getElementById("read-aloud");
-    const status = document.getElementById("audio-status");
-    const player = document.getElementById("audio-player");
-    if (!btn || !status || !player || !lastAudioText) return;
-    btn.disabled = true;
-    status.textContent = "Warming VoxCPM2 and preparing narration…";
-    player.hidden = true;
-    player.removeAttribute("src");
-    try {
-      const tone = (document.querySelector('#tone-row input:checked') || {}).value || "gentle";
-      const audioUrl = await readGradioString("make_audio", [lastAudioText, tone]);
-      if (audioUrl.startsWith("ERROR:")) throw new Error(audioUrl.slice(6).trim());
-      player.src = audioUrl;
-      player.hidden = false;
-      status.textContent = "Ready. Press play when you want to listen.";
-      await player.play().catch(() => {});
-    } catch (err) {
-      status.textContent = String(err.message || err);
-    } finally {
-      btn.disabled = false;
+  async function callMakeExplanation(seed) {
+    var res = await fetch("/gradio_api/call/make_explanation", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ data: [input.value, currentAge, childNameValue, currentTone, seed] }),
+    });
+    if (!res.ok) {
+      var t = await res.text();
+      throw new Error("HTTP " + res.status + ": " + t.slice(0, 200));
     }
+    var evt0 = await res.json();
+    var eventId = evt0.event_id;
+    var evt = await fetch("/gradio_api/call/make_explanation/" + eventId, { headers: { Accept: "text/event-stream" } });
+    if (!evt.ok || !evt.body) throw new Error("SSE open failed");
+    var reader = evt.body.getReader();
+    var dec = new TextDecoder();
+    var buf = "";
+    var result = null;
+    var err = null;
+    while (true) {
+      var r = await reader.read();
+      if (r.done) break;
+      buf += dec.decode(r.value, { stream: true });
+      var idx;
+      while ((idx = buf.indexOf("\n\n")) !== -1) {
+        var frame = buf.slice(0, idx);
+        buf = buf.slice(idx + 2);
+        var lines = frame.split("\n");
+        var line = null;
+        for (var li = 0; li < lines.length; li++) { if (lines[li].startsWith("data: ")) { line = lines[li]; break; } }
+        if (!line) continue;
+        var payload = line.slice(6).trim();
+        if (payload === "null" || payload === "") continue;
+        try {
+          var obj = JSON.parse(payload);
+          var text = _extractSseText(obj);
+          if (text) {
+            result = text.split(SECTION_SEP);
+            while (result.length < 4) result.push("");
+            break;
+          }
+          if (obj && obj.msg === "process_completed" && obj.success === false) {
+            err = (obj.output && obj.output.error) || "Generation failed";
+            break;
+          }
+        } catch (_) {}
+      }
+      if (result !== null || err) break;
+    }
+    if (err) throw new Error(err);
+    if (!result) throw new Error("No result");
+    return result;
   }
 
-  form.addEventListener("submit", async (e) => {
-    e.preventDefault();
-    const sitEl = document.getElementById("situation");
-    if (!sitEl.value.trim()) {
-      sitEl.focus();
-      sitEl.style.borderColor = "var(--wax)";
-      setTimeout(() => { sitEl.style.borderColor = ""; }, 1400);
-      return;
-    }
-    setBusy(true);
-    const stopProgress = renderWriting();
+  function sectionedToText(sectioned) {
+    var labels = ["Opener", "Body", "Closer", "If they ask more"];
+    return sectioned.split(SECTION_SEP).map(function (s, i) { return (s && s.trim()) ? (labels[i] + ": " + s.trim()) : ""; }).filter(Boolean).join("\n\n");
+  }
+
+  async function saveTurn(parentText, sections) {
+    var fabellaText = sectionedToText(SECTION_SEP.join(sections));
     try {
-      const sections = await callMakeExplanation(seed);
-      lastResult = sections;
-      stopProgress();
-      renderExplanation(sections);
+      await fetch("/api/history/append", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: sessionId,
+          parent: parentText,
+          fabella: fabellaText,
+          age: currentAge,
+          child_name: childNameValue,
+          tone: currentTone,
+        }),
+      });
+    } catch (_) {}
+  }
+
+  async function loadHistory() {
+    try {
+      var r = await fetch("/api/history?session_id=" + encodeURIComponent(sessionId));
+      if (!r.ok) return null;
+      return await r.json();
+    } catch (_) { return null; }
+  }
+
+  async function init() {
+    buildTones();
+    syncChips();
+    var data = await loadHistory();
+    if (data && data.profile) {
+      if (data.profile.child_name) childNameValue = data.profile.child_name;
+      if (data.profile.child_age) currentAge = data.profile.child_age;
+      if (data.profile.preferred_tone) currentTone = data.profile.preferred_tone;
+    }
+    childName.value = childNameValue;
+    ageRange.value = String(currentAge);
+    ageReadout.textContent = String(currentAge);
+    syncChips();
+    welcomeOrThread(data && data.messages ? data.messages : []);
+  }
+
+  ageRange.addEventListener("input", function () {
+    ageReadout.textContent = ageRange.value;
+  });
+
+  dlg.addEventListener("close", function () {
+    currentAge = parseInt(ageRange.value, 10) || 7;
+    childNameValue = childName.value.trim();
+    var checked = dlg.querySelector("input[name='tone']:checked");
+    if (checked) currentTone = checked.value;
+    syncChips();
+  });
+
+  openSettings.addEventListener("click", function () { dlg.showModal(); });
+  settingsCancel.addEventListener("click", function () { dlg.close(); });
+
+  clearBtn.addEventListener("click", async function () {
+    if (!confirm("Clear this conversation? This cannot be undone.")) return;
+    try {
+      await fetch("/api/history/clear", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: sessionId }),
+      });
+    } catch (_) {}
+    welcomeOrThread([]);
+  });
+
+  ageChip.addEventListener("click", function () { dlg.showModal(); });
+  toneChip.addEventListener("click", function () { dlg.showModal(); });
+
+  var seed = 0;
+  var form = document.getElementById("composer");
+  form.addEventListener("submit", async function (e) {
+    e.preventDefault();
+    var text = input.value.trim();
+    if (!text) { input.focus(); return; }
+    if (sendBtn.disabled) return;
+    setBusy(true);
+    thread.appendChild(renderUserTurn(text));
+    var typing = renderTyping();
+    thread.appendChild(typing);
+    scrollToEnd();
+    var parentText = text;
+    input.value = "";
+    autosize();
+    try {
+      var sections = await callMakeExplanation(seed);
+      seed += 1;
+      typing.remove();
+      var fabellaText = sectionedToText(SECTION_SEP.join(sections));
+      thread.appendChild(renderFabellaTurn(fabellaText, null));
+      scrollToEnd();
+      saveTurn(parentText, sections);
     } catch (err) {
-      stopProgress();
-      renderError(String(err.message || err));
+      typing.remove();
+      thread.appendChild(renderError(String(err.message || err)));
+      scrollToEnd();
     } finally {
       setBusy(false);
     }
   });
 
-  regenBtn.addEventListener("click", async () => {
-    if (!document.getElementById("situation").value.trim()) return;
-    seed += 1;
-    seedPill.innerHTML = "N&deg;&nbsp;" + seed;
-    setBusy(true);
-    const stopProgress = renderWriting();
-    try {
-      const sections = await callMakeExplanation(seed);
-      lastResult = sections;
-      stopProgress();
-      renderExplanation(sections);
-    } catch (err) {
-      stopProgress();
-      renderError(String(err.message || err));
-    } finally {
-      setBusy(false);
-    }
-  });
+  init();
 })();
 </script>
 </body>
 </html>
 """
-
 INDEX_HTML = (
     INDEX_HTML
     .replace("__TONE_CHOICES__", "[" + ",".join('["' + v + '","' + l + '"]' for v, l in TONE_CHOICES) + "]")

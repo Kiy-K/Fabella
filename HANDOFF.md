@@ -45,23 +45,27 @@ with VoxCPM2.
 
 **Key design decisions:**
 
+- **HF OAuth + bucket per-user JSON history.** Signed-in users are keyed by Hugging Face username; unsigned users use a browser `localStorage` session id. Minimal chat history and parent preferences persist in SQLite at `/models/fabella-data/history.sqlite3` on the mounted HF bucket. This is intentionally not PostgreSQL. Use external Postgres later if multi-replica writes or richer queries are needed.
+
 - **Drafter on LangGraph.** The drafter is a `create_agent` ReAct loop
   with one tool (`validate_explanation`) and a custom middleware that
   jumps to `end` after a successful validation or after a hard cap of
   two tool calls. State machine, conditional edges, tool-call plumbing
   — that's LangGraph's job, and it works.
-- **Judge on Pydantic.** The judge task is bounded — one rubric, one
-  draft, one structured verdict — so it doesn't need an agent loop.
-  Single `llm.invoke()` + `JudgeVerdict.model_validate_json()` + one
-  repair retry. Cross-field consistency (`ok` ⇔ `verdict`) is enforced
-  in code, not in the prompt.
-- **Three separate Modal web_servers, three A10Gs.** Drafter, judge,
-  and TTS don't share a GPU. Independent scaling, independent
-  `scaledown_window`.
+- **Judge on direct OpenAI + Pydantic.** The judge task is bounded — one
+  rubric, one draft, one structured verdict — so it doesn't need an
+  agent loop. `judge.py` calls the judge endpoint through the
+  OpenAI-compatible client, first tries vLLM/OpenAI `response_format`
+  with `JudgeVerdict.model_json_schema()`, then falls back to prompt-only
+  JSON plus one repair retry. Cross-field consistency (`ok` ⇔ `verdict`)
+  is enforced in code, not in the prompt.
+- **Three separate Modal web_servers.** Drafter and judge run on A10G
+  with `min_containers=1` while budget allows. TTS runs separately on
+  L4 with `min_containers=1` so read-aloud is also warm during demos.
 - **TTS only runs on demand.** VoxCPM2 is a separate FastAPI wrapper,
   not vLLM. The HF Space `make_audio` API posts explanation text to
   `/synthesize`, receives `audio/wav`, and returns a base64 data URL to
-  the browser.
+  the browser. It is kept warm on L4 while budget allows.
 - **The judge has NO tool-calling flags on the server side.** Its
   prompt asks for raw JSON in `content`; the Pydantic parser does the
   rest. This dodges Nemotron-3-Nano's chat-template tool-dialect
@@ -84,13 +88,13 @@ with VoxCPM2.
 
 | File | Purpose |
 |------|---------|
-| `app.py` | `gradio.Server` (FastAPI subclass) app, custom HTML+CSS+JS, `make_explanation` API, `make_audio` TTS proxy, no-op `@spaces.GPU` placeholder for HF runtime |
+| `app.py` | `gradio.Server` (FastAPI subclass) app, custom HTML+CSS+JS, `make_explanation` API, `make_audio` TTS proxy, HF OAuth-aware history APIs, per-user JSON files in the HF Bucket, no-op `@spaces.GPU` placeholder for HF runtime |
 | `agent.py` | LangChain ReAct agent. `build_agent(llm, req, judge_llm=None)` returns `(agent, user_prompt)`. `make_validate_tool` builds a closure that calls `judge_explanation()` if a judge is given, else falls back to a rule check. `FabellaAgentMiddleware.before_model` jumps to `end` once validation passes or after `max_tool_calls=2`. `extract_explanation(messages)` parses Opener/Body/Closer/follow-up sections from the validated tool-call draft. |
-| `judge.py` | Pydantic-validated judge. `judge_explanation(llm, draft, req_age, req_tone, child_name, situation) -> JudgeVerdict`. Two attempts (original + repair prompt) before raising `JudgeFailed` for fallback. Tolerant of markdown fences and pretty-printed JSON. |
+| `judge.py` | Direct OpenAI-compatible + Pydantic-validated judge. `judge_explanation(llm, draft, req_age, req_tone, child_name, situation) -> JudgeVerdict`. First tries vLLM/OpenAI `response_format` with `JudgeVerdict.model_json_schema()`, then falls back to prompt-only JSON plus one repair retry before raising `JudgeFailed`. Tolerant of markdown fences and pretty-printed JSON. |
 | `schema.py` | `ExplainRequest` dataclass + `JudgeVerdict` Pydantic model + `JudgeFailed` exception. |
 | `safety.py` | Input sanitization, profanity block, `sanitize_situation`, `explain_to_words(tone)`, `age_bucket(age)`. |
 | `llm.py` | `FabellaVLLM` BaseChatModel wrapping vLLM's OpenAI-compatible API. `bind_tools` builds OpenAI-spec `tools=[...]`, `_generate` passes it and reads `message.tool_calls` from the response. Replay of prior `AIMessage.tool_calls` and `ToolMessage` results into next-turn messages uses the OpenAI chat-completions shape. |
-| `modal_app.py` | Modal deployment: `download_drafter` + `download_judge` + `download_tts`; `serve_drafter` (port 8000), `serve_judge` (port 8001), `serve_tts` (port 8002). One A10G each. |
+| `modal_app.py` | Modal deployment: `download_drafter` + `download_judge` + `download_tts`; `serve_drafter` (port 8000), `serve_judge` (port 8001), `serve_tts` (port 8002). Drafter/judge on A10G; TTS on L4. |
 | `modal_app_gemma.py` | Legacy: a previous-session single-model Modal deploy, kept for reference. Not the live deploy. |
 
 ## What Changed This Session
@@ -154,7 +158,8 @@ The most recent session (pivot to Backyard AI) changed:
   JSON, `judge_explanation()` retries once with a `REPAIR_PROMPT` that
   shows the previous bad response. If both fail, `JudgeFailed` is
   raised and the validate tool falls back to the deterministic rule
-  check.
+  check. The deployed judge path intentionally bypasses LangChain
+  message invocation; LangGraph stays only in the drafter loop.
 - **Middleware `@hook_config(can_jump_to=["end"])` is required.**
   Without it, LangGraph never creates the conditional edge and the
   early-exit silently does nothing.
@@ -178,13 +183,22 @@ The most recent session (pivot to Backyard AI) changed:
      text and produces 48 kHz audio; Gemma 4 could (if enabled)
      read audio and produce text. Don't conflate them when
      debugging.
-- **All A10Gs are independent.** Modal scaledown_window is 10 minutes
-  on each. The first request after idle triggers a ~2 min cold start per
-  LLM container. TTS cold-starts only after **Read aloud** is clicked.
+- **Critical-path LLMs are kept warm.** Drafter and judge use
+  `min_containers=1`, which removes most demo cold-start latency but
+  bills continuously while deployed. TTS also uses `min_containers=1` on L4
+  so **Read aloud** is responsive during demos.
+- **TTS runs on L4.** VoxCPM2 is ~2B and fits smaller GPUs, so
+  `serve_tts` uses `gpu="L4"` plus `min_containers=1` instead of A10G.
+  If L4 availability or latency is bad, switch back to A10G or try Modal
+  GPU fallbacks.
 - **VoxCPM2 TTS is not vLLM.** `serve_tts` writes a generated FastAPI
   server into the container and runs `uvicorn --app-dir /root`. It
   returns `audio/wav` from `/synthesize`; `app.py::make_audio` converts
   that to a base64 data URL for the browser.
+- **Do not switch to `nanovllm-voxcpm` for this demo.** It is faster,
+  but it needs `flash-attn`, changes the API (`target_text`, streamed
+  MP3), and is not worth the integration risk with one day left and a
+  tight GPU budget. Keep the stable official VoxCPM2 server.
 - **`section_sep` is U+001F (Unit Separator).** The `@app.api`
   endpoint returns Opener, Body, Closer, Follow-up joined by `\x1f`.
   The frontend splits on it. Don't use `\n` — body text can contain
@@ -230,7 +244,7 @@ hf spaces restart build-small-hackathon/Fabella
 
 - **Drafter**: 1× A10G, $0.80/hr, 10-min scaledown
 - **Judge**: 1× A10G, $0.80/hr, 10-min scaledown
-- **TTS**: 1× A10G, $0.80/hr, 10-min scaledown, only after **Read aloud**
+- **TTS**: 1× L4, `min_containers=1`, only used after **Read aloud**
 - **At idle**: $0/hr (scaledown)
 - **Typical demo session**: a few minutes warm = ~$0.03-0.05
 

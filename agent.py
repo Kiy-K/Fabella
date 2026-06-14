@@ -329,7 +329,9 @@ def extract_explanation(messages) -> dict:
     1. The `draft` argument of the last validate_explanation tool call
        whose paired ToolMessage returned "OK".
     2. The content of the last AI message (the model's free-form final).
-    3. The rule-based fallback's last surface text.
+    3. The last validate_explanation tool-call draft, even if the judge
+       returned issues. This is the best available draft when middleware
+       ends the loop after `max_tool_calls`.
     """
     tool_results = _tool_results_by_id(messages)
 
@@ -354,6 +356,20 @@ def extract_explanation(messages) -> dict:
             if text.strip():
                 sections = _parse_sections(text)
                 return {**sections, "raw": text}
+
+    # 3. Last attempted validation draft, regardless of judge result. This
+    # prevents a blank UI when the second validation still reports issues and
+    # middleware jumps to end before the model writes a final answer.
+    for msg in reversed(messages):
+        if getattr(msg, "type", "") == "ai" and getattr(msg, "tool_calls", None):
+            for tc in reversed(msg.tool_calls):
+                if not isinstance(tc, dict) or tc.get("name") != "validate_explanation":
+                    continue
+                args = tc.get("args") or {}
+                draft = args.get("draft") if isinstance(args, dict) else None
+                if draft:
+                    sections = _parse_sections(draft)
+                    return {**sections, "raw": draft}
 
     return {"opener": "", "body": "", "closer": "", "followup": "", "raw": ""}
 

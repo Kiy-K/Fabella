@@ -12,8 +12,9 @@ from __future__ import annotations
 
 import json
 import re
+from typing import Any
 
-from langchain_core.messages import HumanMessage, SystemMessage
+from openai import OpenAI
 
 from safety import age_bucket
 from schema import JudgeFailed, JudgeVerdict
@@ -115,6 +116,84 @@ def _extract_json(text: str) -> str | None:
     return t[i : j + 1]
 
 
+def _normalize_verdict(verdict: JudgeVerdict) -> JudgeVerdict:
+    """Keep model output internally consistent after Pydantic validation."""
+    if verdict.ok and verdict.verdict != "approve":
+        return verdict.model_copy(update={"verdict": "approve"})
+    if (not verdict.ok) and verdict.verdict != "revise":
+        return verdict.model_copy(update={"verdict": "revise"})
+    return verdict
+
+
+def _openai_client_for(llm: Any) -> tuple[OpenAI, str] | None:
+    base_url = getattr(llm, "base_url", None)
+    model_name = getattr(llm, "model_name", None)
+    if not base_url or not model_name:
+        return None
+    return OpenAI(base_url=f"{base_url}/v1", api_key="EMPTY"), model_name
+
+
+def _direct_structured_verdict(llm: Any, user: str) -> JudgeVerdict | None:
+    """Use vLLM's OpenAI-compatible structured output when available.
+
+    This keeps the judge bounded and Pydantic-owned instead of turning it
+    into another LangChain agent/tool loop. Some vLLM builds or models may
+    reject `response_format`; callers fall back to prompt-only JSON parsing.
+    """
+    client_model = _openai_client_for(llm)
+    if client_model is None:
+        return None
+    client, model_name = client_model
+
+    schema = JudgeVerdict.model_json_schema()
+    response = client.chat.completions.create(
+        model=model_name,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user},
+        ],
+        temperature=0.0,
+        top_p=1.0,
+        max_tokens=1024,
+        response_format={
+            "type": "json_schema",
+            "json_schema": {
+                "name": "judge_verdict",
+                "schema": schema,
+                "strict": True,
+            },
+        },
+    )
+    text = (response.choices[0].message.content or "").strip()
+    if not text:
+        return None
+    return JudgeVerdict.model_validate_json(text)
+
+
+def _direct_json_verdict(llm: Any, user: str, repair_from: str = "") -> tuple[JudgeVerdict | None, str]:
+    """Prompt for JSON directly through OpenAI client, then validate with Pydantic."""
+    client_model = _openai_client_for(llm)
+    if client_model is None:
+        return None, ""
+    client, model_name = client_model
+    prompt = user if not repair_from else REPAIR_PROMPT.format(last=repair_from)
+    response = client.chat.completions.create(
+        model=model_name,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.0,
+        top_p=1.0,
+        max_tokens=1024,
+    )
+    text = (response.choices[0].message.content or "").strip()
+    candidate = _extract_json(text)
+    if candidate is None:
+        return None, text
+    return JudgeVerdict.model_validate_json(candidate), text
+
+
 def judge_explanation(
     llm,
     draft: str,
@@ -134,40 +213,37 @@ def judge_explanation(
         f"Draft to evaluate:\n{draft}\n\nRubric:\n{rubric}\n\n"
         f"Respond with ONLY the JSON object, no prose."
     )
-    last_text = ""
-    for attempt in (1, 2):
-        if attempt == 1:
-            messages = [
-                SystemMessage(content=SYSTEM_PROMPT),
-                HumanMessage(content=user),
-            ]
-        else:
-            messages = [
-                SystemMessage(content=SYSTEM_PROMPT),
-                HumanMessage(content=REPAIR_PROMPT.format(last=last_text)),
-            ]
+
+    # First choice: vLLM/OpenAI structured output constrained by the Pydantic
+    # JSON schema. This bypasses LangChain entirely for the judge path.
+    if _openai_client_for(llm) is not None:
         try:
-            resp = llm.invoke(messages)
+            structured = _direct_structured_verdict(llm, user)
+            if structured is not None:
+                return _normalize_verdict(structured)
         except Exception as e:
-            if attempt == 2:
-                raise JudgeFailed(f"judge LLM call failed: {e}", last_text=last_text) from e
-            continue
+            print(f"[judge] structured response_format failed; falling back: {type(e).__name__}: {e}", flush=True)
 
-        last_text = (resp.content if isinstance(resp.content, str) else str(resp.content)).strip()
-        candidate = _extract_json(last_text)
-        if candidate is None:
-            continue
-        try:
-            verdict = JudgeVerdict.model_validate_json(candidate)
-        except Exception:
-            continue
+        # Second choice: same direct OpenAI client, but prompt-only JSON plus
+        # Pydantic validation and one repair retry. This is still not LangChain.
+        last_text = ""
+        for attempt in (1, 2):
+            try:
+                verdict, last_text = _direct_json_verdict(
+                    llm,
+                    user,
+                    repair_from=last_text if attempt == 2 else "",
+                )
+            except Exception as e:
+                if attempt == 2:
+                    raise JudgeFailed(f"judge direct JSON call failed: {e}", last_text=last_text) from e
+                continue
+            if verdict is not None:
+                return _normalize_verdict(verdict)
 
-        # Cross-field consistency: ok and verdict must agree.
-        if verdict.ok and verdict.verdict != "approve":
-            verdict = verdict.model_copy(update={"verdict": "approve"})
-        elif (not verdict.ok) and verdict.verdict != "revise":
-            verdict = verdict.model_copy(update={"verdict": "revise"})
+        raise JudgeFailed("judge output was not parseable JSON", last_text=last_text)
 
-        return verdict
-
-    raise JudgeFailed("judge output was not parseable JSON", last_text=last_text)
+    raise JudgeFailed(
+        "judge requires an OpenAI-compatible llm with base_url and model_name",
+        last_text="",
+    )
