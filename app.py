@@ -48,6 +48,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 
 from agent import run_agent
 from schema import ExplainRequest
+import memory as memory_layer
 from safety import (
     has_profanity,
     sanitize_name,
@@ -99,6 +100,17 @@ if attach_huggingface_oauth is not None:
         attach_huggingface_oauth(app)
     except Exception as e:
         print(f"[auth] OAuth endpoints disabled: {type(e).__name__}: {e}", flush=True)
+
+
+# Start the trace publisher. It no-ops on local dev (no HF_TOKEN) and is
+# safe to call when HF_TOKEN is missing. See trace.py for the schema,
+# anonymization rules, and opt-out semantics.
+try:
+    import trace as _trace
+
+    _trace.publisher.start()
+except Exception as e:
+    print(f"[traces] publisher failed to start: {type(e).__name__}: {e}", flush=True)
 
 
 
@@ -223,7 +235,7 @@ def _make_judge(seed: int = 0):
 SECTION_SEP = "\x1f"
 
 
-def _make_explanation_sync(situation: str, age: int, child_name: str, tone: str, seed: int) -> str:
+def _make_explanation_sync(situation: str, age: int, child_name: str, tone: str, seed: int, history: list | None = None, owner_key: str = "", session_id: str = "", share_trace: bool = True) -> str:
     clean_situation = sanitize_situation(situation)
     clean_name = sanitize_name(child_name)
     clean_tone = (tone or "gentle").strip().lower()
@@ -247,12 +259,32 @@ def _make_explanation_sync(situation: str, age: int, child_name: str, tone: str,
     if not (5 <= int(age) <= 12):
         age = 7  # default for out-of-range
 
+    clean_history = []
+    if isinstance(history, list):
+        for item in history[-6:]:
+            if not isinstance(item, dict):
+                continue
+            role = (item.get("role") or "").strip().lower()
+            content = (item.get("content") or "").strip()
+            if role in ("parent", "fabella") and content:
+                clean_history.append({"role": role, "content": content[:1200]})
+
+    # Merge in durable memory from the bucket so the drafter can use it.
+    if not owner_key:
+        owner_key = f"anon:{(session_id or 'anon')[:80]}"
+    mem = memory_layer.read_memory(owner_key)
+    mem_block = memory_layer.memory_context_block(mem)
+    if mem_block:
+        clean_history = [{"role": "memory", "content": mem_block}] + clean_history
+
     req = ExplainRequest(
         situation=clean_situation,
         age=int(age),
         child_name=clean_name,
         tone=clean_tone,
         seed=int(seed or 0),
+        history=clean_history,
+        share_trace=bool(share_trace),
     )
     try:
         print(
@@ -278,7 +310,17 @@ def _make_explanation_sync(situation: str, age: int, child_name: str, tone: str,
 
 
 @app.api(name="make_explanation")
-def make_explanation(situation: str, age: int, child_name: str, tone: str, seed: int) -> str:
+def make_explanation(
+    situation: str,
+    age: int,
+    child_name: str,
+    tone: str,
+    seed: int,
+    history: list | None = None,
+    owner_key: str = "",
+    session_id: str = "",
+    share_trace: bool = True,
+) -> str:
     """Draft a short, kind, age-appropriate explanation.
 
     Returns four sections joined by U+001F:
@@ -286,8 +328,20 @@ def make_explanation(situation: str, age: int, child_name: str, tone: str, seed:
       1: body (1-3 short paragraphs)
       2: closer (one sentence the parent can say to land)
       3: follow-up (optional one sentence if the child has another question)
+
+    `history` is a list of recent parent/Fabella turns so follow-up questions
+    in the same conversation can be answered with the previous explanation
+    in context. The drafter sees the last 6 turns. Long-term memory from
+    the bucket (summary, preferences, durable facts) is folded in
+    automatically when `owner_key` is provided.
+
+    `share_trace` (default True) opts the request into the public,
+    anonymized agent-trace dataset (see trace.py). Pass False to skip
+    publishing this request. The global kill switch is FABELLA_SHARE_TRACES=0.
     """
-    return _make_explanation_sync(situation, age, child_name, tone, seed)
+    return _make_explanation_sync(
+        situation, age, child_name, tone, seed, history, owner_key, session_id, share_trace
+    )
 
 
 def _clean_audio_text(text: str) -> str:
@@ -297,8 +351,44 @@ def _clean_audio_text(text: str) -> str:
     return clean
 
 
-def _make_audio_sync(text: str, tone: str) -> str:
-    clean_text = _clean_audio_text(text)
+def _narration_from_sections(opener: str, body: str, closer: str, followup: str) -> str:
+    """Join the four sections into one plain conversational narration.
+
+    The TTS must never speak the structural labels ("Opener", "Body", "Closer",
+    "If they ask more"). It must never include a child's name. We address the
+    listener as "you" only.
+    """
+    parts = []
+    for piece in (opener, body, closer, followup):
+        piece = (piece or "").strip()
+        if piece:
+            parts.append(piece)
+    return " ".join(parts)
+
+
+def _strip_labeled_draft(text: str) -> str:
+    """Fallback: if a client sends the raw labeled draft, strip the labels."""
+    if not text:
+        return ""
+    out = []
+    for line in text.splitlines():
+        stripped = re.sub(
+            r"^\s*(Opener|Body|Closer|If they ask more|If they ask another question)\s*:\s*",
+            "",
+            line,
+            flags=re.IGNORECASE,
+        )
+        if stripped.strip():
+            out.append(stripped.strip())
+    return " ".join(out).strip()
+
+
+def _make_audio_sync(text: str, tone: str, opener: str = "", body: str = "", closer: str = "", followup: str = "") -> str:
+    if opener or body or closer or followup:
+        clean_text = _narration_from_sections(opener, body, closer, followup)
+    else:
+        clean_text = _strip_labeled_draft(text)
+    clean_text = _clean_audio_text(clean_text)
     if not clean_text:
         return "ERROR: Nothing to read aloud yet."
 
@@ -339,9 +429,14 @@ def _make_audio_sync(text: str, tone: str) -> str:
 
 
 @app.api(name="make_audio")
-def make_audio(text: str, tone: str) -> str:
-    """Synthesize a Fabella explanation as a base64 WAV data URL."""
-    return _make_audio_sync(text, tone)
+def make_audio(text: str, tone: str, opener: str = "", body: str = "", closer: str = "", followup: str = "") -> str:
+    """Synthesize a Fabella explanation as a base64 WAV data URL.
+
+    The frontend should pass the four sections explicitly so the server can
+    join them into a clean conversational narration. `text` is accepted as a
+    legacy fallback and its labels are stripped before TTS.
+    """
+    return _make_audio_sync(text, tone, opener, body, closer, followup)
 
 
 
@@ -430,6 +525,60 @@ async def api_history_clear(request: Request):
                 path.unlink()
             except Exception as e:
                 print(f"[history] clear failed for {owner_key}: {type(e).__name__}: {e}", flush=True)
+    return JSONResponse({"ok": True, "session_id": session_id})
+
+
+# --- Memory endpoints -------------------------------------------------------
+
+
+@app.get("/api/memory")
+async def api_memory(request: Request, session_id: str = ""):
+    owner_key, _, session_id = _owner_from_request(request, session_id)
+    mem = memory_layer.read_memory(owner_key)
+    return JSONResponse({
+        "session_id": session_id,
+        "memory": memory_layer.public_view(mem),
+    })
+
+
+@app.post("/api/memory/append")
+async def api_memory_append(request: Request):
+    payload = await request.json()
+    session_id = str(payload.get("session_id") or "")
+    owner_key, _, session_id = _owner_from_request(request, session_id)
+    parent = sanitize_situation(payload.get("parent") or "")
+    fabella = _clean_audio_text(payload.get("fabella") or "")
+    preferences = {}
+    if "child_name" in payload:
+        preferences["child_name"] = sanitize_name(payload.get("child_name") or "")
+    if "child_age" in payload:
+        try:
+            age = int(payload.get("child_age") or 0)
+            if 3 <= age <= 18:
+                preferences["child_age"] = age
+        except Exception:
+            pass
+    if "preferred_tone" in payload:
+        tone = (payload.get("preferred_tone") or "").strip().lower()
+        if tone in ("gentle", "matter-of-fact", "playful"):
+            preferences["preferred_tone"] = tone
+    if not parent and not fabella:
+        return JSONResponse({"ok": False, "error": "nothing to store"}, status_code=400)
+    res = memory_layer.append_turn(owner_key, parent, fabella, preferences=preferences)
+    return JSONResponse({
+        "ok": True,
+        "session_id": session_id,
+        "extraction": res.extraction,
+        "memory": memory_layer.public_view(res.memory),
+    })
+
+
+@app.post("/api/memory/clear")
+async def api_memory_clear(request: Request):
+    payload = await request.json()
+    session_id = str(payload.get("session_id") or "")
+    owner_key, _, session_id = _owner_from_request(request, session_id)
+    memory_layer.clear_memory(owner_key)
     return JSONResponse({"ok": True, "session_id": session_id})
 
 
@@ -617,15 +766,14 @@ a { color: var(--accent-strong); }
 .bubble p { margin: 0 0 8px; }
 .bubble p:last-child { margin-bottom: 0; }
 
-.section-label {
-  display: inline-block;
-  font: 600 10px var(--font-mono);
-  letter-spacing: 0.14em;
-  text-transform: uppercase;
-  color: var(--accent-strong);
-  margin: 12px 0 4px;
+.section-heading {
+  margin: 14px 0 4px;
+  font: 600 12.5px var(--font-sans);
+  color: var(--text-muted);
+  letter-spacing: 0.02em;
+  text-transform: none;
 }
-.section-label:first-child { margin-top: 0; }
+.section-heading:first-child { margin-top: 0; }
 .section-text { white-space: pre-wrap; }
 
 .turn-actions {
@@ -901,7 +1049,7 @@ a { color: var(--accent-strong); }
       if (m.role === "parent") {
         thread.appendChild(renderUserTurn(m.content));
       } else {
-        thread.appendChild(renderFabellaTurn(m.content, null));
+        thread.appendChild(renderFabellaTurn({ body: m.content }, null));
       }
     });
   }
@@ -924,26 +1072,34 @@ a { color: var(--accent-strong); }
     }
     return out;
   }
-
-  function renderFabellaTurn(rawText, audioUrl) {
+  function renderFabellaTurn(sections, audioUrl) {
     var wrap = document.createElement("article");
     wrap.className = "turn fabella";
-    var sections = parseFabellaText(rawText);
-    var sectionsHTML = sections.length
-      ? sections.map(function (s) { return '<div class="section-label">' + escapeHTML(s.label) + '</div><div class="section-text">' + escapeHTML(s.text) + '</div>'; }).join("")
-      : '<div class="section-text">' + escapeHTML(rawText) + '</div>';
+    var opener = (sections && sections.opener) || "";
+    var body = (sections && sections.body) || "";
+    var closer = (sections && sections.closer) || "";
+    var followup = (sections && sections.followup) || "";
+    function para(text) {
+      return '<p>' + escapeHTML(text).replace(/\n/g, "<br>") + '</p>';
+    }
+    var sectionsHTML =
+      (opener ? '<h3 class="section-heading">Where to begin</h3>' + para(opener) : "") +
+      (body ? '<h3 class="section-heading">The explanation</h3>' + body.split(/\n\s*\n/).filter(Boolean).map(function (p) { return para(p.trim()); }).join("") : "") +
+      (closer ? '<h3 class="section-heading">How to land it</h3>' + para(closer) : "") +
+      (followup ? '<h3 class="section-heading">If they ask another question</h3>' + para(followup) : "");
+    if (!sectionsHTML) {
+      sectionsHTML = '<div class="section-text">' + escapeHTML(String(sections || "")) + '</div>';
+    }
     wrap.innerHTML =
       '<div class="avatar fabella" aria-hidden="true">F</div>' +
       '<div class="bubble">' + sectionsHTML +
         '<div class="turn-actions">' +
           '<button type="button" class="btn-read" data-action="read"><span class="dot"></span>Read aloud</button>' +
-          '<button type="button" class="btn-read" data-action="copy" style="border-color: var(--line); color: var(--text-soft);">Copy</button>' +
         '</div>' +
         '<audio class="audio-inline" controls></audio>' +
         '<div class="audio-status" data-status></div>' +
       '</div>';
     var readBtn = wrap.querySelector('[data-action="read"]');
-    var copyBtn = wrap.querySelector('[data-action="copy"]');
     var audio = wrap.querySelector("audio.audio-inline");
     var status = wrap.querySelector("[data-status]");
     if (audioUrl) {
@@ -956,7 +1112,14 @@ a { color: var(--accent-strong); }
       readBtn.disabled = true;
       status.textContent = "Warming VoxCPM2 and preparing narration...";
       try {
-        var url = await readGradioString("make_audio", [rawText, currentTone]);
+        var url = await readGradioString("make_audio", [
+          "",
+          currentTone,
+          opener,
+          body,
+          closer,
+          followup,
+        ]);
         if (url.startsWith("ERROR:")) throw new Error(url.slice(6).trim());
         audio.src = url;
         audio.classList.add("is-on");
@@ -969,14 +1132,7 @@ a { color: var(--accent-strong); }
         readBtn.dataset.busy = "0";
       }
     });
-    copyBtn.addEventListener("click", async function () {
-      try {
-        await navigator.clipboard.writeText(rawText);
-        status.textContent = "Copied to clipboard.";
-      } catch (err) {
-        status.textContent = "Copy failed.";
-      }
-    });
+    wrap.dataset.sections = JSON.stringify({ opener: opener, body: body, closer: closer, followup: followup });
     return wrap;
   }
 
@@ -1070,11 +1226,13 @@ a { color: var(--accent-strong); }
     return result;
   }
 
-  async function callMakeExplanation(seed) {
+  var conversation = [];
+
+  async function callMakeExplanation(seed, situationText) {
     var res = await fetch("/gradio_api/call/make_explanation", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ data: [input.value, currentAge, childNameValue, currentTone, seed] }),
+      body: JSON.stringify({ data: [situationText, currentAge, childNameValue, currentTone, seed, conversation.slice(-6), "", sessionId] }),
     });
     if (!res.ok) {
       var t = await res.text();
@@ -1124,13 +1282,26 @@ a { color: var(--accent-strong); }
     return result;
   }
 
-  function sectionedToText(sectioned) {
-    var labels = ["Opener", "Body", "Closer", "If they ask more"];
-    return sectioned.split(SECTION_SEP).map(function (s, i) { return (s && s.trim()) ? (labels[i] + ": " + s.trim()) : ""; }).filter(Boolean).join("\n\n");
+  function narrationFromSections(sectionByLabel) {
+    var parts = [];
+    ["Opener", "Body", "Closer", "If they ask more"].forEach(function (k) {
+      var v = (sectionByLabel && sectionByLabel[k]) ? sectionByLabel[k].trim() : "";
+      if (v) parts.push(v);
+    });
+    return parts.join(" ");
   }
 
-  async function saveTurn(parentText, sections) {
-    var fabellaText = sectionedToText(SECTION_SEP.join(sections));
+  function narrationFromSections(s) {
+    var parts = [];
+    ["opener", "body", "closer", "followup"].forEach(function (k) {
+      var v = (s && s[k]) ? String(s[k]).trim() : "";
+      if (v) parts.push(v);
+    });
+    return parts.join(" ");
+  }
+
+  async function saveTurn(parentText, structured) {
+    var fabellaText = narrationFromSections(structured);
     try {
       await fetch("/api/history/append", {
         method: "POST",
@@ -1142,6 +1313,23 @@ a { color: var(--accent-strong); }
           age: currentAge,
           child_name: childNameValue,
           tone: currentTone,
+        }),
+      });
+    } catch (_) {}
+  }
+
+  async function saveMemory(parentText, fabellaText) {
+    try {
+      await fetch("/api/memory/append", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: sessionId,
+          parent: parentText,
+          fabella: fabellaText,
+          child_name: childNameValue,
+          child_age: currentAge,
+          preferred_tone: currentTone,
         }),
       });
     } catch (_) {}
@@ -1187,14 +1375,20 @@ a { color: var(--accent-strong); }
   settingsCancel.addEventListener("click", function () { dlg.close(); });
 
   clearBtn.addEventListener("click", async function () {
-    if (!confirm("Clear this conversation? This cannot be undone.")) return;
+    if (!confirm("Clear this conversation and long-term memory? This cannot be undone.")) return;
     try {
       await fetch("/api/history/clear", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ session_id: sessionId }),
       });
+      await fetch("/api/memory/clear", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: sessionId }),
+      });
     } catch (_) {}
+    conversation = [];
     welcomeOrThread([]);
   });
 
@@ -1217,13 +1411,23 @@ a { color: var(--accent-strong); }
     input.value = "";
     autosize();
     try {
-      var sections = await callMakeExplanation(seed);
+      var sections = await callMakeExplanation(seed, text);
       seed += 1;
       typing.remove();
-      var fabellaText = sectionedToText(SECTION_SEP.join(sections));
-      thread.appendChild(renderFabellaTurn(fabellaText, null));
+      var structured = {
+        opener: (sections[0] || "").trim(),
+        body: (sections[1] || "").trim(),
+        closer: (sections[2] || "").trim(),
+        followup: (sections[3] || "").trim(),
+      };
+      thread.appendChild(renderFabellaTurn(structured, null));
       scrollToEnd();
-      saveTurn(parentText, sections);
+      conversation.push({ role: "parent", content: parentText });
+      var narrationText = narrationFromSections(structured);
+      conversation.push({ role: "fabella", content: narrationText });
+      if (conversation.length > 12) conversation = conversation.slice(-12);
+      saveTurn(parentText, structured);
+      saveMemory(parentText, narrationText);
     } catch (err) {
       typing.remove();
       thread.appendChild(renderError(String(err.message || err)));
@@ -1240,7 +1444,8 @@ a { color: var(--accent-strong); }
 </html>
 """
 INDEX_HTML = (
-    INDEX_HTML
+    INDEX_HTML  # rebuilt for Phase 3 chat UI
+
     .replace("__TONE_CHOICES__", "[" + ",".join('["' + v + '","' + l + '"]' for v, l in TONE_CHOICES) + "]")
     .replace("__EXAMPLES__", "[" + ",".join('"' + s.replace('"', '\\"') + '"' for s in EXAMPLE_SITUATIONS) + "]")
 )

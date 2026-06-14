@@ -14,6 +14,7 @@ import json
 import os
 import re
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -31,16 +32,19 @@ hard things to their child. A parent has just told you about a real
 situation they're facing, and you've written a short, gentle
 explanation the parent can read aloud.
 
-Output shape (always exactly this, no markdown, no extra sections):
+Output shape (always exactly one JSON object, no markdown, no extra
+prose, no code fences):
 
-Opener: <one short sentence the parent can say to start the conversation>
-Body: <1-3 short paragraphs, written in the second person ("you" / "your
-       child"), concrete and warm. About 60-130 words total for the body.>
-Closer: <one short sentence the parent can say to land the conversation>
-If they ask more: <one optional follow-up sentence the parent can use if
-                   the child has another question>
+{
+  "opener": "<one short sentence the parent can say to start the conversation>",
+  "body": "<1-3 short paragraphs, written in the second person ('you' / 'your child'), concrete and warm. About 60-130 words total for the body.>",
+  "closer": "<one short sentence the parent can say to land the conversation>",
+  "followup": "<one optional follow-up sentence the parent can use if the child has another question>"
+}
 
 Strict rules:
+- Output a single JSON object, exactly those four keys.
+- "followup" may be an empty string if there is nothing useful to add.
 - Never use scary imagery, threats, or vivid descriptions of harm.
 - Never moralize, sermonize, or lecture. ("You should always…")
 - Never promise things that aren't true ("It'll all be fine" — only if
@@ -50,18 +54,17 @@ Strict rules:
 - Use the child's age to pick vocabulary and sentence length. For
   young kids (5-7), very short sentences, no abstract words. For
   older kids (8-12), you can be a little more direct.
-- Address the child by name if one was provided.
+- Address the child as "you". Do not invent or use a name.
 - The opener and closer should sound like something a real parent
   would actually say out loud. Not therapist-speak. Not corporate.
 
 Workflow:
-1. Draft the explanation. Start with "Opener:", then "Body:", "Closer:",
-   and "If they ask more:" (the last is optional — write it if it
-   helps, omit it if there's nothing useful to add).
-2. Call the validate_explanation tool with the FULL draft text.
-3. If the tool says "OK", output the final draft. If the tool reports
-   issues, revise and call validate_explanation again. After 2 tool
-   calls, output your best draft anyway.
+1. Compose the four fields as a single JSON object.
+2. Call the validate_explanation tool with that JSON object.
+3. If the tool says "OK", output the same JSON object as your final
+   answer. If the tool reports issues, revise and call
+   validate_explanation again. After 2 tool calls, output your best
+   JSON object anyway.
 """
 
 
@@ -74,34 +77,74 @@ def _strip_prefix(line: str) -> str:
     return re.sub(r"^(Opener|Body|Closer|If they ask more)\s*:\s*", "", line, flags=re.IGNORECASE).strip()
 
 
-def _parse_sections(draft: str) -> dict[str, str]:
-    """Split the draft into Opener / Body / Closer / Follow-up sections.
+def _parse_sections(draft) -> dict[str, str]:
+    """Parse the drafter's output into opener / body / closer / followup.
 
-    Tolerates the model writing 'Opener' on its own line OR inline.
+    Prefers a JSON object. Falls back to a labeled "Opener: / Body: / ..."
+    draft for backward compatibility, and to a whole-string body if no
+    labels are present.
     """
     out = {"opener": "", "body": "", "closer": "", "followup": ""}
-    if not draft:
+    if draft is None:
         return out
 
-    # Find label positions
-    label_re = re.compile(r"^(Opener|Body|Closer|If they ask more)\s*:", re.IGNORECASE | re.MULTILINE)
-    matches = list(label_re.finditer(draft))
-    if not matches:
-        # No labels at all — treat the whole draft as the body
-        out["body"] = draft.strip()
+    if isinstance(draft, dict):
+        out["opener"] = str(draft.get("opener", "") or "").strip()
+        out["body"] = str(draft.get("body", "") or "").strip()
+        out["closer"] = str(draft.get("closer", "") or "").strip()
+        out["followup"] = str(draft.get("followup", "") or "").strip()
         return out
 
-    for i, m in enumerate(matches):
-        label = m.group(1).lower()
-        if label == "if they ask more":
-            key = "followup"
-        else:
-            key = label
-        # body content starts after the label, ends at the next label (or end)
-        start = m.end()
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(draft)
-        content = draft[start:end].strip()
-        out[key] = content
+    if isinstance(draft, str):
+        s = draft.strip()
+        # Try a leading JSON object first.
+        obj: dict | None = None
+        if s.startswith("{"):
+            try:
+                parsed = json.loads(s)
+            except Exception:
+                parsed = None
+            if isinstance(parsed, dict):
+                obj = parsed
+        if obj is None:
+            m = re.search(r"\{[\s\S]*\}", s)
+            if m:
+                try:
+                    parsed = json.loads(m.group(0))
+                except Exception:
+                    parsed = None
+                if isinstance(parsed, dict):
+                    obj = parsed
+        if obj is not None and any(
+            str(obj.get(k, "") or "").strip()
+            for k in ("opener", "body", "closer", "followup")
+        ):
+            out["opener"] = str(obj.get("opener", "") or "").strip()
+            out["body"] = str(obj.get("body", "") or "").strip()
+            out["closer"] = str(obj.get("closer", "") or "").strip()
+            out["followup"] = str(obj.get("followup", "") or "").strip()
+            return out
+
+        # Legacy labeled draft.
+        label_re = re.compile(
+            r"^(Opener|Body|Closer|If they ask more)\s*:",
+            re.IGNORECASE | re.MULTILINE,
+        )
+        matches = list(label_re.finditer(s))
+        if matches:
+            for i, m in enumerate(matches):
+                label = m.group(1).lower()
+                key = "followup" if label == "if they ask more" else label
+                start = m.end()
+                end = matches[i + 1].start() if i + 1 < len(matches) else len(s)
+                out[key] = s[start:end].strip()
+            return out
+
+        # No labels, no JSON: treat the whole string as the body.
+        out["body"] = s
+        return out
+
+    out["body"] = str(draft).strip()
     return out
 
 
@@ -121,7 +164,7 @@ def make_validate_tool(
     min_w, max_w = explain_to_words(req_tone)
     bucket = age_bucket(req_age)
 
-    def _judge(draft: str) -> str:
+    def _judge(draft) -> str:
         assert judge_llm is not None
         try:
             from judge import judge_explanation, JudgeFailed
@@ -147,15 +190,15 @@ def make_validate_tool(
         # ok=false but no concrete issues — be safe, revise
         return "Issues: " + (verdict.reasoning or "The draft does not meet the rubric.")
 
-    def _rule_based_check(draft: str) -> str:
+    def _rule_based_check(draft) -> str:
         issues = []
         sections = _parse_sections(draft)
         if not sections["opener"]:
-            issues.append("Missing the 'Opener:' line.")
+            issues.append("Missing the 'opener' field.")
         if not sections["body"]:
-            issues.append("Missing the 'Body:' section.")
+            issues.append("Missing the 'body' field.")
         if not sections["closer"]:
-            issues.append("Missing the 'Closer:' line.")
+            issues.append("Missing the 'closer' field.")
         body_words = _word_count(sections["body"])
         if body_words < min_w:
             issues.append(f"Body too short ({body_words} words; minimum {min_w}).")
@@ -172,16 +215,20 @@ def make_validate_tool(
         return "Issues: " + " ".join(issues)
 
     @tool
-    def validate_explanation(draft: str) -> str:
-        """Validate an explanation draft against the request.
+    def validate_explanation(draft) -> str:
+        """Validate a Fabella explanation draft against the request.
+
+        The drafter is asked to pass a JSON object with the four fields:
+        'opener', 'body', 'closer', and optional 'followup'. The validator
+        tolerates a JSON string, a Python dict, or a labeled draft text
+        (backward compatibility).
 
         When a judge model is available, the judge does a multi-criteria
         review (opener/body/closer present, length, tone, no moralizing,
         age-appropriateness). Otherwise a deterministic rule check is used.
 
         Args:
-            draft: The full draft text. Must include 'Opener:', 'Body:',
-                and 'Closer:' labels.
+            draft: JSON object, JSON string, or labeled draft text.
 
         Returns:
             'OK' if the draft passes. Otherwise a short report listing
@@ -255,16 +302,45 @@ def _build_user_prompt(req) -> str:
         "middle": "clear sentences, concrete metaphors are fine",
         "older": "richer vocabulary is fine, but keep it direct",
     }[bucket]
-    name_hint = f"The child's name is '{req.child_name}'. Use it naturally once." if req.child_name else "No name was given. Address the parent ('your child') or use 'you'."
+    history = list(getattr(req, "history", []) or [])
+    memory_block = ""
+    recent_lines: list[str] = []
+    for turn in history[-6:]:
+        role = (turn.get("role") or "").strip().lower()
+        content = (turn.get("content") or "").strip()
+        if not content:
+            continue
+        if role == "memory":
+            memory_block = content
+            continue
+        label = "Parent" if role == "parent" else "Fabella"
+        recent_lines.append(f"{label}: {content}")
+    history_block = ""
+    if recent_lines:
+        history_block = (
+            "Earlier in this conversation (for context, do not repeat verbatim):\n"
+            + "\n".join(recent_lines)
+            + "\n\n"
+        )
+    durable_block = ""
+    if memory_block:
+        durable_block = (
+            "Long-term memory for this parent (use it; do not repeat verbatim):\n"
+            f"{memory_block}\n\n"
+        )
     return (
         f"A parent needs help explaining a hard thing to their child.\n\n"
-        f"The situation: {req.situation}\n\n"
+        f"{durable_block}"
+        f"{history_block}"
+        f"The latest thing the parent is asking about: {req.situation}\n\n"
         f"The child is {req.age} years old ({bucket} reader).\n"
-        f"{name_hint}\n"
+        f"Address the child as 'you'. Do not invent or use a name.\n"
         f"Tone: {req.tone}. Vocabulary: {vocab}.\n\n"
-        f"Draft a short explanation in the Opener / Body / Closer / "
-        f"(optional) If-they-ask-more shape. Then call "
-        f"validate_explanation on the full draft."
+        f"If this is a follow-up, stay consistent with the previous explanation "
+        f"and answer the new question in the same warm register. "
+        f"Respond with a single JSON object that has exactly these four "
+        f"keys: 'opener', 'body', 'closer', 'followup'. Then call "
+        f"validate_explanation with the same JSON object."
     )
 
 
@@ -302,6 +378,7 @@ def run_agent(llm, req, judge_llm=None) -> dict:
     )
     agent, user_prompt = build_agent(llm, req, judge_llm=judge_llm)
     print(f"[agent] invoking", flush=True)
+    started = time.monotonic()
     try:
         result = agent.invoke(
             {"messages": [{"role": "user", "content": user_prompt}]},
@@ -319,7 +396,47 @@ def run_agent(llm, req, judge_llm=None) -> dict:
     print(f"[agent] invoke complete", flush=True)
     msgs = result.get("messages", []) if isinstance(result, dict) else []
     print(f"[agent] {len(msgs)} messages in trace", flush=True)
-    return extract_explanation(msgs)
+    parsed = extract_explanation(msgs)
+    _maybe_publish_trace(req, user_prompt, msgs, parsed, started)
+    return parsed
+
+
+def _maybe_publish_trace(req, user_prompt, messages, parsed, started) -> None:
+    """Submit an anonymized trace to the Hub publisher, if capture is on.
+
+    Per-request opt-out: ``req.share_trace=False`` skips that row. The
+    global kill switch is ``FABELLA_SHARE_TRACES=0`` (handled inside the
+    publisher). Failures here must never affect the parent-facing flow.
+    """
+    if getattr(req, "share_trace", True) is False:
+        return
+    try:
+        from trace import build_trace_record, publisher
+
+        judge_verdict = None
+        for m in reversed(messages or []):
+            if getattr(m, "type", "") == "ai" and getattr(m, "tool_calls", None):
+                break
+        # The judge verdict is captured from the ToolMessage that came back
+        # from validate_explanation; it lives in the messages list already,
+        # so we don't re-invoke the judge here. The publisher's anonymizer
+        # will read it from the tool result if it parses cleanly. For now
+        # we leave judge=None and let the dataset row carry the final draft
+        # only — adding judge verdict re-parse would couple trace.py to
+        # judge.py's internals.
+        latency_ms = int((time.monotonic() - started) * 1000)
+        record = build_trace_record(
+            req=req,
+            user_prompt=user_prompt,
+            system_prompt=SYSTEM_PROMPT,
+            messages=messages,
+            final_draft=parsed,
+            judge_verdict=judge_verdict,
+            latency_ms=latency_ms,
+        )
+        publisher.submit(record)
+    except Exception as e:
+        print(f"[agent] trace publish skipped: {type(e).__name__}: {e}", flush=True)
 
 
 def extract_explanation(messages) -> dict:
@@ -346,7 +463,7 @@ def extract_explanation(messages) -> dict:
                 draft = (args or {}).get("draft") if isinstance(args, dict) else None
                 if draft:
                     sections = _parse_sections(draft)
-                    return {**sections, "raw": draft}
+                    return {**sections, "raw": json.dumps(draft) if not isinstance(draft, str) else draft}
 
     # 2. Last AI message with content (the model wrote a final answer
     #    after the validate_explanation call, without re-emitting the tool args)
@@ -369,7 +486,7 @@ def extract_explanation(messages) -> dict:
                 draft = args.get("draft") if isinstance(args, dict) else None
                 if draft:
                     sections = _parse_sections(draft)
-                    return {**sections, "raw": draft}
+                    return {**sections, "raw": json.dumps(draft) if not isinstance(draft, str) else draft}
 
     return {"opener": "", "body": "", "closer": "", "followup": "", "raw": ""}
 

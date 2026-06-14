@@ -20,6 +20,11 @@ class ExplainRequest:
         tone: "gentle" | "matter-of-fact" | "playful". Controls the
             register of the explanation.
         seed: Determinism for the drafter (the judge is temperature=0).
+        history: Recent parent/Fabella turns in this conversation. The
+            drafter uses this as context so follow-up questions
+            ("What if she asks if grandma will die?") get a coherent
+            answer that builds on the previous explanation. Each item is
+            a dict with keys "role" ("parent"|"fabella") and "content".
     """
 
     situation: str
@@ -27,6 +32,8 @@ class ExplainRequest:
     child_name: str = ""
     tone: str = "gentle"
     seed: int = 0
+    history: list = ()  # type: ignore[type-arg]
+    share_trace: bool = True
 
 
 # --- Judge output ---------------------------------------------------------

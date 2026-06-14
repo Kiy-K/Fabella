@@ -74,18 +74,14 @@ def _build_rubric(req_age: int, req_tone: str, child_name: str, situation: str) 
         "middle": "clear sentences, paragraphs of 3-5 sentences, concrete metaphors are fine",
         "older": "richer vocabulary and slightly longer paragraphs are fine, but keep it direct",
     }[bucket]
-    name_hint = (
-        f"The child's name is '{child_name}'. Use it naturally once."
-        if child_name else "No name was given. Address the parent ('your child') or use 'you'."
-    )
     return (
         f"The child is {req_age} years old ({bucket} reader). Target vocabulary: {vocab}.\n"
         f"The tone is {req_tone}.\n"
-        f"{name_hint}\n"
+        f"Address the child as 'you'. Never invent or use a name.\n"
         f"The parent's situation (for context, not for inclusion in the explanation):\n"
         f"  {situation}\n\n"
         f"Evaluate the draft against this rubric:\n"
-        f"1. The Opener, Body, and Closer are all present and clearly labelled.\n"
+        f"1. The JSON object has 'opener', 'body', 'closer', and (optionally) 'followup', all non-empty.\n"
         f"2. The body addresses the child's likely feeling in the first paragraph.\n"
         f"3. The body explains the situation in concrete, age-appropriate terms. No abstract or vague language.\n"
         f"4. The body is roughly 60-130 words. It does NOT lecture or moralize.\n"
@@ -196,7 +192,7 @@ def _direct_json_verdict(llm: Any, user: str, repair_from: str = "") -> tuple[Ju
 
 def judge_explanation(
     llm,
-    draft: str,
+    draft,
     req_age: int,
     req_tone: str,
     child_name: str,
@@ -204,13 +200,21 @@ def judge_explanation(
 ) -> JudgeVerdict:
     """Ask the small judge model for a structured verdict on `draft`.
 
-    Tries once, then once more with a repair prompt if the first response
-    doesn't validate. Raises `JudgeFailed` if both attempts fail; the
-    caller is expected to fall back to the rule-based check.
+    `draft` may be a JSON object, a JSON string, or a labeled draft text.
+    The judge is told to verify the JSON shape (opener/body/closer/followup).
+    Tries once with structured output, then once with prompt-only JSON plus
+    a repair retry. Raises `JudgeFailed` if both attempts fail; the caller
+    is expected to fall back to the rule-based check.
     """
+    if isinstance(draft, (dict, list)):
+        draft_text = json.dumps(draft, ensure_ascii=False)
+    else:
+        draft_text = str(draft or "")
     rubric = _build_rubric(req_age, req_tone, child_name, situation)
     user = (
-        f"Draft to evaluate:\n{draft}\n\nRubric:\n{rubric}\n\n"
+        f"Draft to evaluate (JSON object with 'opener', 'body', 'closer', 'followup'):\n"
+        f"{draft_text}\n\n"
+        f"Rubric:\n{rubric}\n\n"
         f"Respond with ONLY the JSON object, no prose."
     )
 

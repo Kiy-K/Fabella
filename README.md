@@ -161,6 +161,7 @@ Every Fabella generation that opts in (the default) appends an anonymized row to
 - `schema.py` — `ExplainRequest` dataclass + `JudgeVerdict` Pydantic model + `JudgeFailed` exception
 - `llm.py` — `FabellaVLLM` BaseChatModel wrapping vLLM's OpenAI-compatible API; `bind_tools` builds the OpenAI-spec `tools=[...]` payload
 - `modal_app.py` — Modal deployment (drafter + judge on A10G, VoxCPM2 TTS on L4)
+- `memory.py` — bucket-backed parent memory and preference summaries for follow-up continuity
 - `safety.py` — input sanitization, profanity block, `explain_to_words(tone)`
 - `trace.py` — anonymized ReAct-trace capture and Hub publishing for the [fabella-traces](https://huggingface.co/datasets/build-small-hackathon/fabella-traces) dataset
 
