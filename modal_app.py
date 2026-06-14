@@ -215,16 +215,16 @@ ENFORCE_EAGER = True
 # aggressively summarized (see ``agent.py::_summarize_turns``) and the
 # judge only reads the situation + draft + rubric.
 #
-# 4k on the drafter covers: fixed instruction overhead (~700 chars) +
+# 8k on the drafter covers: fixed instruction overhead (~700 chars) +
 # aggressively-summarized older history (capped at 320 chars) + last
 # 2 turns verbatim (~300 chars) + current situation + 4 drafter
-# tool-call drafts in the ReAct loop. We have plenty of headroom for a
-# long parent conversation, and the KV cache footprint is small.
+# tool-call drafts in the ReAct loop. Plenty of headroom for long
+# parent conversations without the model hitting context limits.
 #
-# 2k on the judge covers: rubric + drafter draft + verdict JSON output.
-# The judge never reads history, so 2k is generous.
-DRAFTER_MAX_MODEL_LEN = "4096"
-JUDGE_MAX_MODEL_LEN = "2048"
+# 4k on the judge covers: rubric + drafter draft + verdict JSON
+# output. The judge never reads history, so 4k is generous headroom.
+DRAFTER_MAX_MODEL_LEN = "8192"
+JUDGE_MAX_MODEL_LEN = "4096"
 
 
 def _vllm_cmd(model_dir: Path, served_name: str, port: int, extra: list[str], max_model_len: str) -> list[str]:
