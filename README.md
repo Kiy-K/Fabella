@@ -93,10 +93,11 @@ All three models sit comfortably under the **32B cap** — Fabella uses **10B of
 - **HF OAuth** — enabled for personalization; unsigned users fall back to browser-local anonymous sessions.
 - **HF Bucket per-user JSON** — minimal chat history and parent preferences persist at `/data/fabella-data/user-<owner_key>.json` (signed-in users keyed by HF username, anonymous users keyed by a `localStorage` session ID).
 - **Modal** — one app, three web servers, all `min_containers=0` with a 2-minute `scaledown_window` so they cold-start on demand (3-day demo budget):
-  - **Drafter** (A10G) — vLLM with `--language-model-only --enable-auto-tool-choice --tool-call-parser gemma4 --enforce-eager`
-  - **Judge** (A10G) — vLLM with `--enforce-eager` (no tool-calling flags; Nemotron's tool-call dialect isn't a vLLM built-in)
+  - **Drafter** (A10G) — vLLM with `--language-model-only --enable-auto-tool-choice --tool-call-parser gemma4 --enforce-eager --safetensors-load-strategy eager --max-model-len 2048`
+  - **Judge** (A10G) — vLLM with `--enforce-eager --safetensors-load-strategy eager --max-model-len 2048` (no tool-calling flags; Nemotron's tool-call dialect isn't a vLLM built-in)
   - **TTS** (L4) — VoxCPM2 wrapped in a tiny FastAPI app on the smallest GPU that fits
-  - **`--enforce-eager`** on both vLLM servers skips CUDA-graph capture. Saves 20–40s of cold start at a small per-token throughput cost; the right tradeoff for a demo where first-token latency matters more than tokens/sec.
+  - **Image-baked weights**: drafter, judge, and TTS weights are baked into their respective images via `Image.run_function(download_*)`, so cold start is image-pull + eager-mode init + load-to-VRAM (no first-boot Volume read).
+  - **Cold-start tunings**: `--enforce-eager` skips CUDA-graph capture (saves 20–40s of cold start at a small per-token throughput cost). `VLLM_DEEP_GEMM_WARMUP=skip` skips the dense-model MoE kernel warmup. `VLLM_USE_AOT_COMPILE=1` + `VLLM_CACHE_ROOT=/root/.cache/vllm` lets torch.compile artifacts persist across cold starts via the cache volume. `--max-model-len 2048` keeps the warmup profile small.
   - **Cold-start warmup ping** on Space import: `app.py::_warm_modal_endpoints` fires a non-blocking `/health` request to each endpoint from a daemon thread. The cold start happens while the parent is reading the welcome screen; the first real request lands on a warm container.
 - **LangChain 1.x** ReAct loop with a custom middleware (`FabellaAgentMiddleware`) that jumps to `end` after a successful validation or after a hard cap of two tool calls. The `@hook_config(can_jump_to=["end"])` is required — without it the early-exit silently does nothing.
 - **Pydantic v2** for the judge's structured output. `JudgeVerdict` has five fields (`ok`, `issues`, `score`, `verdict`, `reasoning`); cross-field consistency (`ok` ⇔ `verdict`) is enforced in code, not in the prompt.

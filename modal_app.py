@@ -185,11 +185,49 @@ MINUTES = 60
 # - We force --enforce-eager to skip vLLM's CUDA-graph capture (saves
 #   20-40s of cold start) at a small per-token throughput cost. Fine
 #   for a demo where first-token latency matters more than tokens/sec.
+#
+# Image-bake strategy (v0.7+):
+# The drafter and judge images each bake their own model weights into a
+# Modal image layer via `Image.run_function(download_drafter)`. Cold start
+# then becomes: image pull (cached) + vLLM import + eager-mode init + load
+# to VRAM. Net effect: roughly 20-30s shaved off each cold start vs.
+# reading weights from a Modal Volume on first boot.
+#
+# Environment knobs that further trim the warmup:
+# - VLLM_DEEP_GEMM_WARMUP=skip   (skip the JIT warmup of MoE-style
+#   matmul kernels; our 4B drafter and 4B judge are dense, so this
+#   warmup is pure startup cost).
+# - VLLM_USE_AOT_COMPILE=1       (write torch.compile artifacts to a
+#   cache volume so subsequent cold starts re-use them — cuts ~10s off
+#   each first warmup).
+# - --safetensors-load-strategy eager (read the whole safetensors into
+#   CPU RAM upfront instead of memory-mapping; the weights are local on
+#   the bake layer or the Volume, so mmap's NFS-prefetch benefit doesn't
+#   apply. Avoids a one-shot mmap-fault stall at first request).
 LLM_MIN_CONTAINERS = 0
 TTS_MIN_CONTAINERS = 0
 SCALEDOWN_WINDOW_S = 2 * MINUTES  # tear down after 2 min of no traffic
 TTS_GPU = "L4"
 ENFORCE_EAGER = True
+
+# Tuned for the actual requests we issue (parent-typed situation +
+# age/tone + 4 short drafter calls + 1 judge call). 2048 covers the
+# longest expected conversation with comfortable headroom. Lowering
+# from 8192 -> 2048 cuts KV-cache memory by 4x, which lets vLLM finish
+# the profile/warmup pass on a smaller working set.
+MAX_MODEL_LEN = "2048"
+
+# Env vars injected into the vLLM image AND exported to the runtime so
+# the bake and the live process agree.
+VLLM_RUNTIME_ENV = {
+    "VLLM_DEEP_GEMM_WARMUP": "skip",
+    "VLLM_USE_AOT_COMPILE": "1",
+    # The cache volume is mounted at /root/.cache/vllm. Without this
+    # path override vLLM uses a per-process /tmp dir that does not
+    # survive across cold starts.
+    "VLLM_CACHE_ROOT": "/root/.cache/vllm",
+    "TORCHINDUCTOR_CACHE_DIR": "/root/.cache/vllm/torch_compile_cache/inductor",
+}
 
 
 def _vllm_cmd(model_dir: Path, served_name: str, port: int, extra: list[str]) -> list[str]:
@@ -200,24 +238,51 @@ def _vllm_cmd(model_dir: Path, served_name: str, port: int, extra: list[str]) ->
         "--port", str(port),
         "--served-model-name", served_name,
         "--uvicorn-log-level", "info",
-        "--max-model-len", "8192",
-        "--gpu-memory-utilization", "0.90",
+        "--max-model-len", MAX_MODEL_LEN,
+        "--gpu-memory-utilization", "0.85",  # leave a bit for AOT artifacts
         "--enforce-eager",                  # cold-start: skip CUDA-graph capture
+        "--safetensors-load-strategy", "eager",
     ]
-    if ENFORCE_EAGER:
-        # Re-asserted for clarity; the flag is already in `cmd`.
-        pass
     cmd.extend(extra)
     return cmd
 
 
+# Bake the drafter weights into the vLLM image. ``run_function`` runs a
+# Function at image-build time and snapshots the filesystem, so the
+# shipped image already contains ``/models/gemma-4-E4B-it``. This drops
+# the cold-start weight read from ~10-20s to ~0s. The build is one-time
+# per code change that breaks the image cache.
+vllm_drafter_image = (
+    vllm_image
+    .env(VLLM_RUNTIME_ENV)
+    .run_function(
+        download_drafter,
+        volumes={MODEL_PATH: model_volume},
+        force_build=False,
+    )
+)
+
+
+# Same idea for the judge image.
+vllm_judge_image = (
+    vllm_image
+    .env(VLLM_RUNTIME_ENV)
+    .run_function(
+        download_judge,
+        volumes={MODEL_PATH: model_volume},
+        force_build=False,
+    )
+)
+
+
 @app.function(
-    image=vllm_image,
+    image=vllm_drafter_image,
     gpu="A10G",
     min_containers=LLM_MIN_CONTAINERS,
     scaledown_window=SCALEDOWN_WINDOW_S,
     timeout=10 * MINUTES,
     volumes={MODEL_PATH: model_volume, "/root/.cache/vllm": vllm_cache_volume},
+    env=VLLM_RUNTIME_ENV,
 )
 @modal.concurrent(max_inputs=10)
 @modal.web_server(port=DRAFTER_PORT, startup_timeout=10 * MINUTES)
@@ -238,12 +303,13 @@ def serve_drafter():
 
 
 @app.function(
-    image=vllm_image,
+    image=vllm_judge_image,
     gpu="A10G",
     min_containers=LLM_MIN_CONTAINERS,
     scaledown_window=SCALEDOWN_WINDOW_S,
     timeout=10 * MINUTES,
     volumes={MODEL_PATH: model_volume, "/root/.cache/vllm": vllm_cache_volume},
+    env=VLLM_RUNTIME_ENV,
 )
 @modal.concurrent(max_inputs=10)
 @modal.web_server(port=JUDGE_PORT, startup_timeout=10 * MINUTES)
@@ -371,8 +437,18 @@ def download_tts(force: bool = False):
     print("TTS download complete")
 
 
+# Bake VoxCPM2 weights into the TTS image so cold start only has to
+# load them to VRAM (~5-10s), not download from the Volume (~10-20s).
+# Defined after ``download_tts`` so the forward reference resolves.
+tts_image_baked = tts_image.run_function(
+    download_tts,
+    volumes={MODEL_PATH: model_volume},
+    force_build=False,
+)
+
+
 @app.function(
-    image=tts_image,
+    image=tts_image_baked,
     gpu=TTS_GPU,
     min_containers=TTS_MIN_CONTAINERS,
     scaledown_window=SCALEDOWN_WINDOW_S,

@@ -55,7 +55,8 @@ The product design has two distinct execution layers, each tuned to its job:
 - TTS is separate from drafter/judge and only called from `make_audio` when the user clicks **Read aloud**.
 - Drafter and judge use `min_containers=0` and `scaledown_window=2 * MINUTES` so containers fall to zero when idle. This keeps the GPU bill under control for the 3-day demo. The Space fires a background warmup ping to each endpoint on import, so the cold start happens while the parent is reading the welcome screen; the first real request then lands on a warm container.
 - TTS also uses `min_containers=0` (same policy) and runs on `L4` instead of A10G because VoxCPM2 is small enough for a cheaper/newer GPU class.
-- Drafter and judge vLLM flags also include `--enforce-eager` to skip CUDA-graph capture. This trades a small amount of steady-state throughput for a much faster first-token time after cold start, which is the right tradeoff for a demo where first-token latency matters more than tokens/sec.
+- Drafter and judge vLLM flags include `--enforce-eager --safetensors-load-strategy eager --max-model-len 2048 --gpu-memory-utilization 0.85`. Eager mode skips CUDA-graph capture (saves 20-40s of cold start). Lower max-model-len keeps the warmup profile small. Safetensors eager load avoids an mmap-fault stall on first request.
+- vLLM env vars: `VLLM_DEEP_GEMM_WARMUP=skip` (our 4B models are dense, so the JIT warmup is pure startup cost), `VLLM_USE_AOT_COMPILE=1` + `VLLM_CACHE_ROOT=/root/.cache/vllm` (compile artifacts persist across cold starts via the cache volume). The drafter, judge, and TTS weights are baked into the vLLM image via `Image.run_function(download_*)` so cold start is image-pull + eager-mode init + load-to-VRAM.
 
 ## Live URLs
 
