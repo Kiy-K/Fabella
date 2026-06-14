@@ -130,7 +130,7 @@ Three claimed, three skipped. Fabella's honest inventory:
 | Badge | Status | Why |
 |---|---|---|
 | **Off-Brand** 🎨 | Claimed | Custom HTML+CSS+JS frontend served by `gradio.Server` — zero default Gradio chrome. |
-| **Sharing is Caring** 📡 | Claimed | Anonymized ReAct traces published to [`build-small-hackathon/fabella-traces`](https://huggingface.co/datasets/build-small-hackathon/fabella-traces). See `trace.py` for the schema and anonymization rules. |
+| **Sharing is Caring** 📡 | Claimed | Anonymized ReAct traces published to [`Kiy-K/fabella-traces`](https://huggingface.co/datasets/Kiy-K/fabella-traces). See `trace.py` for the schema and anonymization rules. |
 | **Field Notes** 📓 | Claimed | Blog/report on what was built and learned, by the maker. |
 | **Off the Grid** 🔌 | Skipped | Drafter, judge, and TTS all run on Modal — a cloud GPU platform, not "in front of you." |
 | **Well-Tuned** 🎯 | Skipped | No fine-tuning; Gemma 4 E4B-IT and Nemotron Nano 4B are used stock, no PEFT/LoRA, no published checkpoint on the Hub. |
@@ -150,7 +150,7 @@ In other words: the canvas is `gradio.Server`'s FastAPI subclass, but the page i
 
 ## Agent trace dataset
 
-Every Fabella generation that opts in (the default) appends an anonymized row to [`build-small-hackathon/fabella-traces`](https://huggingface.co/datasets/build-small-hackathon/fabella-traces). One JSONL row per request, capturing the full ReAct loop:
+Every Fabella generation that opts in (the default) appends an anonymized row to [`Kiy-K/fabella-traces`](https://huggingface.co/datasets/Kiy-K/fabella-traces). One JSONL row per request, capturing the full ReAct loop:
 
 - `agent.system_prompt` — the drafter prompt (static, in-repo)
 - `agent.user_prompt` — the built user message, with the raw situation text replaced by `<redacted>`
@@ -175,7 +175,7 @@ Every Fabella generation that opts in (the default) appends an anonymized row to
 - `modal_app.py` — Modal deployment (drafter + judge on A10G, VoxCPM2 TTS on L4)
 - `memory.py` — bucket-backed parent memory and preference summaries for follow-up continuity
 - `safety.py` — input sanitization, profanity block, `explain_to_words(tone)`
-- `trace.py` — anonymized ReAct-trace capture and Hub publishing for the [fabella-traces](https://huggingface.co/datasets/build-small-hackathon/fabella-traces) dataset
+- `trace.py` — anonymized ReAct-trace capture and Hub publishing for the [fabella-traces](https://huggingface.co/datasets/Kiy-K/fabella-traces) dataset
 
 ---
 

@@ -66,13 +66,14 @@ log = logging.getLogger("fabella.traces")
 
 # --- Configuration ---------------------------------------------------------
 
-# Where the public dataset lives. The "build-small-hackathon" namespace is
-# shared with the rest of the hackathon submissions; the slash keeps it on
-# the build-small-hackathon org and avoids needing repo creation rights on
-# the user's personal namespace.
+# Where the public dataset lives. The default is the user's personal
+# namespace (``Kiy-K/fabella-traces``) because the build-small-hackathon
+# org's tokens are contributor-level and can't create new repos. To
+# publish to the org, an admin must pre-create the dataset and the
+# Space owner must override ``FABELLA_TRACE_REPO`` to the org path.
 DATASET_REPO = os.environ.get(
     "FABELLA_TRACE_REPO",
-    "build-small-hackathon/fabella-traces",
+    "Kiy-K/fabella-traces",
 )
 
 # Buffer flush triggers. The background flusher will push whenever EITHER
@@ -527,6 +528,28 @@ class TracePublisher:
 
         api = HfApi(token=self._hf_token)
         new_lines = "\n".join(r.to_jsonl() for r in rows) + "\n"
+
+        # The dataset repo may not exist on the first ever push (the
+        # Space's HF_TOKEN may or may not have rights to create repos
+        # in the build-small-hackathon org; if it does, ``create_repo``
+        # is idempotent). Calling it lazily means we don't need a
+        # separate one-time setup step.
+        try:
+            api.create_repo(
+                repo_id=DATASET_REPO,
+                repo_type="dataset",
+                exist_ok=True,
+                private=False,
+            )
+        except Exception as e:
+            # 403/401 here means the token has read-only access to the
+            # org. The Space owner can pre-create the repo via the
+            # ``huggingface-cli repo create`` command. We still try
+            # the upload below so a pre-existing dataset still works.
+            log.warning(
+                f"[traces] could not ensure {DATASET_REPO} exists: "
+                f"{type(e).__name__}: {e}"
+            )
 
         existing = ""
         try:
