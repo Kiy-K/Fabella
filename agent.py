@@ -294,6 +294,50 @@ class FabellaAgentMiddleware(AgentMiddleware):
         return None
 
 
+def _summarize_turns(turns: list[dict], max_chars: int = 320) -> str:
+    """Compress older conversation turns into a single tight summary line.
+
+    Budget: we have to be aggressive about input size so the drafter
+    fits in a small ``max_model_len`` (and so we don't burn drafter
+    tokens on a long verbatim history every request). The strategy is:
+
+    - Keep the last 2 turns verbatim (recent context, the parent is
+      likely to follow up about the most recent reply).
+    - Compress everything older into a single short line of the form
+      ``"Earlier: <parent topic 1> -> <fabella answer 1>; ..."``,
+      truncated to ``max_chars`` so the summary stays predictable.
+
+    The compression is deterministic and rule-based: the drafter prompt
+    is small enough that the marginal cost of an LLM-based summarizer
+    is not worth the savings. We deliberately drop prose and keep only
+    the topic and the answer shape.
+    """
+    if not turns:
+        return ""
+    pieces: list[str] = []
+    budget = max_chars
+    for turn in turns:
+        role = (turn.get("role") or "").strip().lower()
+        content = (turn.get("content") or "").strip()
+        if not content:
+            continue
+        if role == "memory":
+            # Long-term memory is surfaced separately as a durable block.
+            continue
+        label = "P" if role == "parent" else "F"
+        # Compress a single turn to ~140 chars so 4 old turns fit in
+        # 320 chars with separator overhead.
+        compressed = " ".join(content.split())
+        if len(compressed) > 140:
+            compressed = compressed[:137].rstrip() + "..."
+        pieces.append(f"{label}:{compressed}")
+        if sum(len(s) for s in pieces) > budget:
+            # Drop the oldest piece so we keep the most recent context
+            # within budget.
+            pieces.pop(0)
+    return "; ".join(pieces)
+
+
 def _build_user_prompt(req) -> str:
     """Build the parent's request as a user-prompt for the drafter."""
     bucket = age_bucket(req.age)
@@ -304,8 +348,14 @@ def _build_user_prompt(req) -> str:
     }[bucket]
     history = list(getattr(req, "history", []) or [])
     memory_block = ""
-    recent_lines: list[str] = []
-    for turn in history[-6:]:
+    # Split history into a verbatim-tail (last 2 turns) and an
+    # aggressively-summarized earlier block. This keeps the prompt
+    # input size predictable as conversations grow, which is the
+    # whole point of running on a small max_model_len and a tight GPU
+    # budget.
+    tail_lines: list[str] = []
+    older_turns: list[dict] = []
+    for turn in history:
         role = (turn.get("role") or "").strip().lower()
         content = (turn.get("content") or "").strip()
         if not content:
@@ -314,14 +364,23 @@ def _build_user_prompt(req) -> str:
             memory_block = content
             continue
         label = "Parent" if role == "parent" else "Fabella"
-        recent_lines.append(f"{label}: {content}")
+        tail_lines.append(f"{label}: {content}")
+    if len(tail_lines) > 2:
+        older_turns = [{"role": "parent" if ln.startswith("Parent") else "fabella",
+                        "content": ln.split(": ", 1)[1]}
+                       for ln in tail_lines[:-2]]
+        tail_lines = tail_lines[-2:]
     history_block = ""
-    if recent_lines:
+    if tail_lines or older_turns:
         history_block = (
-            "Earlier in this conversation (for context, do not repeat verbatim):\n"
-            + "\n".join(recent_lines)
-            + "\n\n"
+            "Earlier in this conversation (do not repeat verbatim):\n"
         )
+        summary = _summarize_turns(older_turns, max_chars=320)
+        if summary:
+            history_block += f"Earlier: {summary}\n"
+        if tail_lines:
+            history_block += "Most recent:\n" + "\n".join(tail_lines) + "\n"
+        history_block += "\n"
     durable_block = ""
     if memory_block:
         durable_block = (

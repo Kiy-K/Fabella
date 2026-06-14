@@ -210,12 +210,38 @@ SCALEDOWN_WINDOW_S = 2 * MINUTES  # tear down after 2 min of no traffic
 TTS_GPU = "L4"
 ENFORCE_EAGER = True
 
-# Tuned for the actual requests we issue (parent-typed situation +
-# age/tone + 4 short drafter calls + 1 judge call). 2048 covers the
-# longest expected conversation with comfortable headroom. Lowering
-# from 8192 -> 2048 cuts KV-cache memory by 4x, which lets vLLM finish
-# the profile/warmup pass on a smaller working set.
-MAX_MODEL_LEN = "2048"
+# Per-server max_model_len. We size these to the actual workload, not
+# the model's nominal context window, because the drafter prompt is
+# aggressively summarized (see ``agent.py::_summarize_turns``) and the
+# judge only reads the situation + draft + rubric.
+#
+# 4k on the drafter covers: fixed instruction overhead (~700 chars) +
+# aggressively-summarized older history (capped at 320 chars) + last
+# 2 turns verbatim (~300 chars) + current situation + 4 drafter
+# tool-call drafts in the ReAct loop. We have plenty of headroom for a
+# long parent conversation, and the KV cache footprint is small.
+#
+# 2k on the judge covers: rubric + drafter draft + verdict JSON output.
+# The judge never reads history, so 2k is generous.
+DRAFTER_MAX_MODEL_LEN = "4096"
+JUDGE_MAX_MODEL_LEN = "2048"
+
+
+def _vllm_cmd(model_dir: Path, served_name: str, port: int, extra: list[str], max_model_len: str) -> list[str]:
+    cmd = [
+        "vllm", "serve",
+        str(model_dir),
+        "--host", "0.0.0.0",
+        "--port", str(port),
+        "--served-model-name", served_name,
+        "--uvicorn-log-level", "info",
+        "--max-model-len", max_model_len,
+        "--gpu-memory-utilization", "0.85",  # leave a bit for AOT artifacts
+        "--enforce-eager",                  # cold-start: skip CUDA-graph capture
+        "--safetensors-load-strategy", "eager",
+    ]
+    cmd.extend(extra)
+    return cmd
 
 # Env vars injected into the vLLM image AND exported to the runtime so
 # the bake and the live process agree.
@@ -228,23 +254,6 @@ VLLM_RUNTIME_ENV = {
     "VLLM_CACHE_ROOT": "/root/.cache/vllm",
     "TORCHINDUCTOR_CACHE_DIR": "/root/.cache/vllm/torch_compile_cache/inductor",
 }
-
-
-def _vllm_cmd(model_dir: Path, served_name: str, port: int, extra: list[str]) -> list[str]:
-    cmd = [
-        "vllm", "serve",
-        str(model_dir),
-        "--host", "0.0.0.0",
-        "--port", str(port),
-        "--served-model-name", served_name,
-        "--uvicorn-log-level", "info",
-        "--max-model-len", MAX_MODEL_LEN,
-        "--gpu-memory-utilization", "0.85",  # leave a bit for AOT artifacts
-        "--enforce-eager",                  # cold-start: skip CUDA-graph capture
-        "--safetensors-load-strategy", "eager",
-    ]
-    cmd.extend(extra)
-    return cmd
 
 
 # Bake the drafter weights into the vLLM image. ``run_function`` runs a
@@ -293,11 +302,15 @@ def serve_drafter():
     template uses <|tool_call|>...<tool_call|> markers).
     """
     model_dir = Path(MODEL_PATH) / DRAFTER_DIR
-    cmd = _vllm_cmd(model_dir, DRAFTER_SERVED_NAME, DRAFTER_PORT, extra=[
-        "--language-model-only",          # skip multimodal processor
-        "--enable-auto-tool-choice",
-        "--tool-call-parser", "gemma4",
-    ])
+    cmd = _vllm_cmd(
+        model_dir, DRAFTER_SERVED_NAME, DRAFTER_PORT,
+        max_model_len=DRAFTER_MAX_MODEL_LEN,
+        extra=[
+            "--language-model-only",          # skip multimodal processor
+            "--enable-auto-tool-choice",
+            "--tool-call-parser", "gemma4",
+        ],
+    )
     print(f"Starting drafter vLLM: {' '.join(cmd)}", flush=True)
     subprocess.Popen(cmd)
 
@@ -321,7 +334,11 @@ def serve_judge():
     This dodges the chat-template tool-dialect dance entirely.
     """
     model_dir = Path(MODEL_PATH) / JUDGE_DIR
-    cmd = _vllm_cmd(model_dir, JUDGE_SERVED_NAME, JUDGE_PORT, extra=[])
+    cmd = _vllm_cmd(
+        model_dir, JUDGE_SERVED_NAME, JUDGE_PORT,
+        max_model_len=JUDGE_MAX_MODEL_LEN,
+        extra=[],
+    )
     print(f"Starting judge vLLM: {' '.join(cmd)}", flush=True)
     subprocess.Popen(cmd)
 
