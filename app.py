@@ -19,11 +19,22 @@ import urllib.error
 import urllib.request
 import re
 import uuid
+import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+os.environ.setdefault("HF_HUB_DISABLE_EXPERIMENTAL_WARNING", "1")
+warnings.filterwarnings(
+    "ignore",
+    message=".*HTTP_422_UNPROCESSABLE_ENTITY.*",
+)
+warnings.filterwarnings(
+    "ignore",
+    message="OAuth is not supported outside of a Space environment.*",
+)
 
 
 def _silence_asyncio_invalid_fd_warning() -> None:
@@ -95,6 +106,7 @@ except ImportError:
 from gradio import Server
 
 app = Server()
+demo = app
 if attach_huggingface_oauth is not None:
     try:
         attach_huggingface_oauth(app)
@@ -1232,7 +1244,7 @@ a { color: var(--accent-strong); }
     var res = await fetch("/gradio_api/call/make_explanation", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ data: [situationText, currentAge, childNameValue, currentTone, seed, conversation.slice(-6), "", sessionId] }),
+      body: JSON.stringify({ data: [situationText, currentAge, childNameValue, currentTone, seed, conversation.slice(-6), "", sessionId, true] }),
     });
     if (!res.ok) {
       var t = await res.text();

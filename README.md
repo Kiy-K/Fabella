@@ -181,6 +181,12 @@ export MODAL_TTS_URL=https://khoitruong071510--fabella-serve-tts.modal.run
 python app.py
 ```
 
+Runtime notes:
+
+- `app.py` exposes `demo = app` for Gradio hot reload, while still launching the `gradio.Server` instance directly in normal runs.
+- The custom frontend calls `/gradio_api/call/make_explanation` with all nine API inputs, including `share_trace`, so Gradio's queue input validation matches the Python handler signature.
+- Known Hugging Face OAuth and Gradio/Starlette deprecation warnings are filtered at startup; they do not affect Space behavior.
+
 ---
 
 ## Constraints honored
