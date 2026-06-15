@@ -660,8 +660,8 @@ async def api_history_download(request: Request, session_id: str = ""):
         "messages": _public_messages(history.get("messages", [])),
         "memory": memory_layer.public_view(mem),
         "trace_publication": {
-            "dataset": "Kiy-K/fabella-traces",
-            "url": "https://huggingface.co/datasets/Kiy-K/fabella-traces",
+            "dataset": "build-small-hackathon/fabella-traces",
+            "url": "https://huggingface.co/datasets/build-small-hackathon/fabella-traces",
             "this_session_max_published_rows": shared_count,
             "this_session_max_turns": turn_count,
             "anonymization": [
@@ -669,6 +669,7 @@ async def api_history_download(request: Request, session_id: str = ""):
                 "Raw situation text is never stored; only its SHA-256 hash, the first 60 chars, and its length are kept.",
                 "Freeform history turns are replaced with role + length counts in the published row.",
                 "The drafter's static system prompt is shipped in full (it's a public string in this repo).",
+                "Each row is its own data/<trace_id>.json file (race-free across Space replicas).",
             ],
         },
     }
@@ -1110,7 +1111,7 @@ a { color: var(--accent-strong); }
     <p style="margin: 0 0 12px; font: 400 13px/1.4 var(--font-sans); color: var(--text-soft);">
       Your chat history and memory are stored in this Space's bucket, keyed to you.
       When you opt in, redacted copies of the drafter/judge trace are published to a
-      <a href="https://huggingface.co/datasets/Kiy-K/fabella-traces" target="_blank" rel="noopener">public dataset</a>
+      <a href="https://huggingface.co/datasets/build-small-hackathon/fabella-traces" target="_blank" rel="noopener">public dataset</a>
       — they contain no raw situation text, no child name, and no trace that links back to you.
     </p>
     <div style="display:flex; gap: 8px; flex-wrap: wrap;">

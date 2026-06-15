@@ -10,6 +10,8 @@ pinned: true
 hf_oauth: true
 license: apache-2.0
 short_description: Small words for big questions.
+datasets:
+  - build-small-hackathon/fabella-traces
 tags:
   - track:backyard
   - sponsor:openbmb
@@ -135,7 +137,7 @@ Three claimed, three skipped. Fabella's honest inventory:
 | Badge | Status | Why |
 |---|---|---|
 | **Off-Brand** 🎨 | Claimed | Custom HTML+CSS+JS frontend served by `gradio.Server` — zero default Gradio chrome. |
-| **Sharing is Caring** 📡 | Re-scoped | For this demo, the public dataset was removed by the maker. Parents pull their own data at any time via the **Download my history** button in the settings dialog (calls `GET /api/history/download` and returns a JSON bundle of their chat + memory + a `trace_publication` statement). The `trace.py` publisher and `Kiy-K/fabella-traces` schema are still in the repo for re-deployment (set `FABELLA_SHARE_TRACES=1` to resume Hub publish). |
+| **Sharing is Caring** 📡 | Claimed | One anonymized row per request lands at [build-small-hackathon/fabella-traces](https://huggingface.co/datasets/build-small-hackathon/fabella-traces) — schema, anonymization, and 5 seed rows in the public card. The Space publishes only when `FABELLA_SHARE_TRACES=1` is set (default `0`); parents can always pull their own data via the **Download my history** button regardless. |
 | **Field Notes** 📓 | Claimed | Blog/report on what was built and learned, by the maker. |
 | **Off the Grid** 🔌 | Skipped | Drafter, judge, and TTS all run on Modal — a cloud GPU platform, not "in front of you." |
 | **Well-Tuned** 🎯 | Skipped | No fine-tuning; Gemma 4 E4B-IT and Nemotron Nano 4B are used stock, no PEFT/LoRA, no published checkpoint on the Hub. |
@@ -168,8 +170,8 @@ For this demo, the public dataset was removed by the maker. Parents pull their o
   "messages": [{"role": "parent", "content": "...", "age": 7, "tone": "gentle", "created_at": "..."}, ...],
   "memory": {"facts": [...], "summary": "...", "threads": [...], "history_turns": 4},
   "trace_publication": {
-    "dataset": "Kiy-K/fabella-traces",
-    "url": "https://huggingface.co/datasets/Kiy-K/fabella-traces",
+    "dataset": "build-small-hackathon/fabella-traces",
+    "url": "https://huggingface.co/datasets/build-small-hackathon/fabella-traces",
     "this_session_max_published_rows": 3,
     "this_session_max_turns": 4,
     "anonymization": [
@@ -182,7 +184,7 @@ For this demo, the public dataset was removed by the maker. Parents pull their o
 }
 ```
 
-**Re-deploying the public dataset:** the `trace.py` publisher and the `Kiy-K/fabella-traces` schema are still in the repo. Set `FABELLA_SHARE_TRACES=1` on the Space to resume writing rows to that dataset. With the env var unset (or `0`), the publisher is a no-op and rows only live in the per-parent bucket.
+**Re-deploying the public dataset:** the `trace.py` publisher and the `build-small-hackathon/fabella-traces` schema are still in the repo. Set `FABELLA_SHARE_TRACES=1` on the Space to resume writing rows to that dataset. With the env var unset (or `0`), the publisher is a no-op and rows only live in the per-parent bucket.
 
 ---
 
@@ -196,7 +198,7 @@ For this demo, the public dataset was removed by the maker. Parents pull their o
 - `modal_app.py` — Modal deployment (drafter + judge on A10G, VoxCPM2 TTS on L4)
 - `memory.py` — bucket-backed parent memory and preference summaries for follow-up continuity
 - `safety.py` — input sanitization, profanity block, `explain_to_words(tone)`
-- `trace.py` — anonymized ReAct-trace capture and Hub publishing for the [fabella-traces](https://huggingface.co/datasets/Kiy-K/fabella-traces) dataset
+- `trace.py` — anonymized ReAct-trace capture and Hub publishing for the [fabella-traces](https://huggingface.co/datasets/build-small-hackathon/fabella-traces) dataset
 
 ---
 

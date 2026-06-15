@@ -88,14 +88,15 @@ log = logging.getLogger("fabella.traces")
 
 # --- Configuration ---------------------------------------------------------
 
-# Where the public dataset lives. The default is the user's personal
-# namespace (``Kiy-K/fabella-traces``) because the build-small-hackathon
-# org's tokens are contributor-level and can't create new repos. To
-# publish to the org, an admin must pre-create the dataset and the
-# Space owner must override ``FABELLA_TRACE_REPO`` to the org path.
+# Where the public dataset lives. The default is the hackathon org's
+# namespace (``build-small-hackathon/fabella-traces``) so the live Space
+# publishes to the canonical repo attached to the Space's "Datasets" tab.
+# For local dev where the Space's HF_TOKEN cannot create repos in the org
+# namespace, set ``FABELLA_TRACE_REPO=Kiy-K/fabella-traces`` (the maker's
+# personal dataset) to publish to a fallback path.
 DATASET_REPO = os.environ.get(
     "FABELLA_TRACE_REPO",
-    "Kiy-K/fabella-traces",
+    "build-small-hackathon/fabella-traces",
 )
 
 # Buffer flush triggers. The background flusher will push whenever EITHER
@@ -111,12 +112,12 @@ FLUSH_INTERVAL_S = float(os.environ.get("FABELLA_TRACE_FLUSH_INTERVAL_S", "300")
 DATASET_DIR = "data"
 PROBE_PATH = f"{DATASET_DIR}/.probe.json"
 
-# Capture is OFF by default. The public dataset was removed by the maker
-# for this demo; the only path to data is the per-parent "Download my
-# history" self-export button in ``app.py::api_history_download``. To
-# re-enable the public dataset for re-deployment, set
-# ``FABELLA_SHARE_TRACES=1`` on the Space and the publisher will resume
-# writing to ``Kiy-K/fabella-traces``.
+# Capture is OFF by default. The dataset card and schema are live at
+# ``build-small-hackathon/fabella-traces``; the only path to data right
+# now is the per-parent "Download my history" self-export button in
+# ``app.py::api_history_download``. To re-enable publishing for a new
+# deployment, set ``FABELLA_SHARE_TRACES=1`` on the Space and the
+# publisher will resume writing rows to the org dataset.
 SHARE_TRACES = os.environ.get("FABELLA_SHARE_TRACES", "0").lower() in (
     "1",
     "true",
