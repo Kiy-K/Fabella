@@ -35,6 +35,8 @@ tags:
 
 The 90-second walkthrough shows the parent flow (situation → age → tone → validated draft → read aloud), the 3-model pipeline (Gemma 4 E4B drafter · Nemotron 3 Nano judge · VoxCPM2 read-aloud), the HF Bucket memory layer, and the anonymized trace dataset. Narration is ElevenLabs (`eleven_multilingual_v2`, voice `Roger`); caption timings are derived from a Whisper `small.en` pass over the synthesized audio.
 
+**Social post:** [X / Twitter](https://x.com/Kiy_K127/status/2066356328466202914?s=20)
+
 Source code: [`Kiy-K/Fabella`](https://github.com/Kiy-K/Fabella)
 
 ---
@@ -99,7 +101,7 @@ All three models sit comfortably under the **32B cap** — Fabella uses **10B of
   - **Image-baked weights**: drafter, judge, and TTS weights are baked into their respective images via `Image.run_function(download_*)`, so cold start is image-pull + eager-mode init + load-to-VRAM (no first-boot Volume read).
   - **Aggressive summarization in `agent.py`**: `_build_user_prompt` keeps the last 2 conversation turns verbatim and compresses everything older into a single short line capped at 320 chars. This is what lets us run the drafter at `--max-model-len 8192` instead of the model's nominal 32k, and it directly reduces per-request drafter token cost on long follow-up conversations.
   - **Cold-start tunings**: `--enforce-eager` skips CUDA-graph capture (saves 20–40s of cold start at a small per-token throughput cost). `VLLM_DEEP_GEMM_WARMUP=skip` skips the dense-model MoE kernel warmup. `VLLM_USE_AOT_COMPILE=1` + `VLLM_CACHE_ROOT=/root/.cache/vllm` lets torch.compile artifacts persist across cold starts via the cache volume.
-  - **Cold-start warmup ping** on Space import: `app.py::_warm_modal_endpoints` fires a non-blocking `/health` request to each endpoint from a daemon thread. The cold start happens while the parent is reading the welcome screen; the first real request lands on a warm container.
+  - **No warmup ping on Space import.** The previous deployment fired a `/health` request to each endpoint on Space startup so the first parent click would land on a warm container. We removed it: every Space restart (code push, env-var change, periodic rebalance) paid for an A10G cold start whether or not a parent ever arrived. With the ping gone, the first request after a quiet period still pays a 30-60s cold start (image-baked weights, eager mode, AOT compile cache, deep-gemm warmup skip) and the 2-minute `scaledown_window` keeps a parent who reads the welcome screen and clicks a chip on a warm container for free.
 - **LangChain 1.x** ReAct loop with a custom middleware (`FabellaAgentMiddleware`) that jumps to `end` after a successful validation or after a hard cap of two tool calls. The `@hook_config(can_jump_to=["end"])` is required — without it the early-exit silently does nothing.
 - **Pydantic v2** for the judge's structured output. `JudgeVerdict` has five fields (`ok`, `issues`, `score`, `verdict`, `reasoning`); cross-field consistency (`ok` ⇔ `verdict`) is enforced in code, not in the prompt.
 
@@ -222,4 +224,4 @@ Runtime notes:
 - **≤ 32B params** · both LLMs are 4B; total inference is 10B
 - **Gradio app** · hosted as an HF Space, custom UI served by `gradio.Server`
 - **No API key needed for the models** · all open weights on Modal credits
-- **Show, don't tell** · demo video + social post in submission
+- **Show, don't tell** · [demo video](https://youtu.be/dAoy1GRbEV8) + [X social post](https://x.com/Kiy_K127/status/2066356328466202914?s=20)

@@ -125,47 +125,17 @@ except Exception as e:
     print(f"[traces] publisher failed to start: {type(e).__name__}: {e}", flush=True)
 
 
-def _warm_modal_endpoints() -> None:
-    """Best-effort warmup of the Modal drafter, judge, and TTS endpoints.
-
-    All three Modal containers are deployed with ``min_containers=0`` to
-    keep the GPU bill under control for the 3-day demo. The first real
-    request after a quiet period therefore pays a 60-120s cold start on
-    the LLM containers (image import + vLLM init + model load).
-
-    This routine pings each endpoint's ``/health`` route from a daemon
-    thread as soon as the Space boots, so the cold start happens in the
-    background while the parent reads the welcome screen. The first
-    real parent click then lands on a warm container. Failures are
-    silent; the warmup is a hint, not a requirement.
-    """
-
-    def _ping(url: str) -> None:
-        if not url:
-            return
-        try:
-            import urllib.request
-
-            with urllib.request.urlopen(f"{url.rstrip('/')}/health", timeout=300) as r:
-                r.read()
-        except Exception as e:
-            print(f"[warmup] {url} ping failed: {type(e).__name__}: {e}", flush=True)
-
-    import threading
-
-    def _all() -> None:
-        for label, url in (
-            ("drafter", MODAL_DRAFTER_URL),
-            ("judge", MODAL_JUDGE_URL),
-            ("tts", MODAL_TTS_URL),
-        ):
-            print(f"[warmup] pinging {label} at {url}", flush=True)
-            threading.Thread(target=_ping, args=(url,), daemon=True, name=f"warmup-{label}").start()
-
-    threading.Thread(target=_all, daemon=True, name="fabella-warmup").start()
-
-
-_warm_modal_endpoints()
+# The previous deployment ran a warmup ping to ``/health`` on each
+# Modal endpoint at Space startup, so the first parent click would land
+# on a warm container. We removed that ping: the Space restarts several
+# times per day (code pushes, env-var changes, HF rebalances), and each
+# restart paid for an A10G cold start whether or not a parent ever
+# arrived. With the ping gone, the first real request after a quiet
+# period still pays a 30-60s cold start (image-baked weights, eager
+# mode, AOT compile cache, deep-gemm warmup skip) but every subsequent
+# request within the Modal scaledown window lands on a warm container
+# for free. The 2-minute scaledown window is wide enough that a parent
+# who reads the welcome screen and clicks a chip pays zero extra.
 
 
 
