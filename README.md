@@ -73,18 +73,19 @@ The parent sees the validated draft, not a raw model output. If the judge reject
 | **Drafter** | `google/gemma-4-E4B-it` | 4B | Modal A10G · vLLM | Apache 2.0, fast on short empathetic text, native tool calling | **LangGraph ReAct** — needs the state machine (draft → validate → revise → end) with tool calls and middleware-driven early exit |
 | **Judge** | `nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16` | 4B | Modal A10G · vLLM | Follows structured-output instructions reliably | **Pydantic v2** + one LLM call + one repair retry — task is bounded, no agent loop needed |
 | **Read aloud** | `openbmb/VoxCPM2` | ~2B | Modal L4 · FastAPI | Apache 2.0, 48 kHz, voice-description control | Separate FastAPI server; only called when the user clicks **Read aloud** |
+| **Voice note** | `nvidia/nemotron-3.5-asr-streaming-0.6b` | 0.6B | Modal T4 · NeMo | Small multilingual streaming ASR with language prompts | Optional **Record** button: transcribes a short parent voice note into the textbox for review before drafting |
 
 The split is deliberate. The drafter needs agentic machinery (state machine, tool calls, conditional edges, jump-to-end). The judge doesn't — its job is "receive rubric + draft, return a structured verdict." Pydantic gives disciplined output, type safety, and a one-shot repair retry. Two layers, two files, two execution models: `agent.py` for the loop, `judge.py` for the verdict.
 
-All three models sit comfortably under the **32B cap** — Fabella uses **10B of parameters total** for inference, with the largest single model at 4B. That makes Fabella a candidate for the **Tiny Titan** special award (≤4B).
+The core drafter/judge/read-aloud path uses **10B of parameters total**, with the largest single model at 4B. The optional voice-note input adds a separate 0.6B ASR model. The largest single model remains 4B, so Fabella is still a candidate for the **Tiny Titan** special award (≤4B).
 
 ---
 
 ## Sponsor prize notes
 
 - **OpenAI / Codex** — Codex was used as a coding assistant for early boilerplate and scaffolding. This sponsor-track note is about development assistance, not runtime inference: Fabella's model pipeline uses Gemma, Nemotron, and VoxCPM2.
-- **NVIDIA** — `nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16` is the second model in the pipeline and acts as the structured-output judge in `judge.py`.
-- **Modal** — Modal runs all three inference services: the Gemma drafter, the Nemotron judge, and the VoxCPM2 TTS service.
+- **NVIDIA** — `nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16` is the second model in the pipeline and acts as the structured-output judge in `judge.py`. `nvidia/nemotron-3.5-asr-streaming-0.6b` powers the optional **Record** voice-note input.
+- **Modal** — Modal runs the inference services: the Gemma drafter, the Nemotron judge, the VoxCPM2 TTS service, and the isolated T4 ASR experiment endpoint.
 - **OpenBMB** — `openbmb/VoxCPM2` powers the optional **Read aloud** feature.
 
 ---
@@ -94,7 +95,8 @@ All three models sit comfortably under the **32B cap** — Fabella uses **10B of
 - **HF Space (CPU)** — custom HTML + CSS + JS frontend served by `gradio.Server` (FastAPI subclass). Chat-style, parent-friendly UI: welcome screen with example situations, alternating parent / Fabella turns, per-turn Read-aloud button, no default Gradio chrome.
 - **HF OAuth** — enabled for personalization; unsigned users fall back to browser-local anonymous sessions.
 - **HF Bucket per-user JSON** — minimal chat history and parent preferences persist at `/data/fabella-data/user-<owner_key>.json` (signed-in users keyed by HF username, anonymous users keyed by a `localStorage` session ID).
-- **Modal** — one app, three web servers, all `min_containers=0` with a 2-minute `scaledown_window` so they cold-start on demand (3-day demo budget):
+- **Voice note ASR** — the optional **Record** button uses the browser `MediaRecorder`, sends a short base64 audio note to the Space's `transcribe_audio` API, and the Space proxies it to an isolated Modal T4 endpoint (`modal_asr_app.py`). The ASR endpoint follows NVIDIA NeMo's documented cache-aware streaming path (`set_inference_prompt`, `CacheAwareStreamingAudioBuffer`, `conformer_stream_step`) rather than plain `transcribe()`.
+- **Modal core app** — one app, three web servers, all `min_containers=0` with a 2-minute `scaledown_window` so they cold-start on demand (3-day demo budget):
   - **Drafter** (A10G) — vLLM with `--language-model-only --enable-auto-tool-choice --tool-call-parser gemma4 --enforce-eager --safetensors-load-strategy eager --max-model-len 8192`
   - **Judge** (A10G) — vLLM with `--enforce-eager --safetensors-load-strategy eager --max-model-len 4096` (no tool-calling flags; Nemotron's tool-call dialect isn't a vLLM built-in)
   - **TTS** (L4) — VoxCPM2 wrapped in a tiny FastAPI app on the smallest GPU that fits
@@ -102,6 +104,7 @@ All three models sit comfortably under the **32B cap** — Fabella uses **10B of
   - **Aggressive summarization in `agent.py`**: `_build_user_prompt` keeps the last 2 conversation turns verbatim and compresses everything older into a single short line capped at 320 chars. This is what lets us run the drafter at `--max-model-len 8192` instead of the model's nominal 32k, and it directly reduces per-request drafter token cost on long follow-up conversations.
   - **Cold-start tunings**: `--enforce-eager` skips CUDA-graph capture (saves 20–40s of cold start at a small per-token throughput cost). `VLLM_DEEP_GEMM_WARMUP=skip` skips the dense-model MoE kernel warmup. `VLLM_USE_AOT_COMPILE=1` + `VLLM_CACHE_ROOT=/root/.cache/vllm` lets torch.compile artifacts persist across cold starts via the cache volume.
   - **No warmup ping on Space import.** The previous deployment fired a `/health` request to each endpoint on Space startup so the first parent click would land on a warm container. We removed it: every Space restart (code push, env-var change, periodic rebalance) paid for an A10G cold start whether or not a parent ever arrived. With the ping gone, the first request after a quiet period still pays a 30-60s cold start (image-baked weights, eager mode, AOT compile cache, deep-gemm warmup skip) and the 2-minute `scaledown_window` keeps a parent who reads the welcome screen and clicks a chip on a warm container for free.
+- **Modal ASR experiment app** — separate `fabella-asr-experiment` deployment on T4 with `min_containers=0`; only wakes when a parent clicks **Record**.
 - **LangChain 1.x** ReAct loop with a custom middleware (`FabellaAgentMiddleware`) that jumps to `end` after a successful validation or after a hard cap of two tool calls. The `@hook_config(can_jump_to=["end"])` is required — without it the early-exit silently does nothing.
 - **Pydantic v2** for the judge's structured output. `JudgeVerdict` has five fields (`ok`, `issues`, `score`, `verdict`, `reasoning`); cross-field consistency (`ok` ⇔ `verdict`) is enforced in code, not in the prompt.
 
