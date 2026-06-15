@@ -762,8 +762,21 @@ INDEX_HTML = r"""<!doctype html>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap">
+<script>
+  (function () {
+    try {
+      var allowed = ["storybook","bedtime","kitchen-table","garden","notebook","playroom"];
+      var saved = localStorage.getItem("fabella-theme");
+      var theme = allowed.indexOf(saved) >= 0 ? saved : "storybook";
+      document.documentElement.dataset.theme = theme;
+    } catch (_) {
+      document.documentElement.dataset.theme = "storybook";
+    }
+  })();
+</script>
 <style>
-:root {
+:root,
+:root[data-theme="storybook"] {
   --bg: #f7f4ec;
   --bg-2: #efeae0;
   --surface: #ffffff;
@@ -788,26 +801,117 @@ INDEX_HTML = r"""<!doctype html>
   --ease: cubic-bezier(.2,.7,.2,1);
   --font-sans: "Outfit", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  color-scheme: light;
 }
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #14181d;
-    --bg-2: #1a1f25;
-    --surface: #1d242b;
-    --surface-2: #232a32;
-    --line: #2d343d;
-    --line-soft: #262c34;
-    --text: #ece7d8;
-    --text-soft: #cfd2cc;
-    --text-muted: #8d9089;
-    --accent: #8fbf83;
-    --accent-strong: #b5d3a9;
-    --accent-soft: #2a3a30;
-    --bubble-parent: #2e5a36;
-    --bubble-parent-text: #f1f1ec;
-    --bubble-fabella: #232a32;
-    --bubble-fabella-text: #ece7d8;
-  }
+:root[data-theme="bedtime"] {
+  --bg: #0f1320;
+  --bg-2: #141a2b;
+  --surface: #1a2138;
+  --surface-2: #202a45;
+  --line: #2a3354;
+  --line-soft: #232b46;
+  --text: #e6e8f2;
+  --text-soft: #c2c7d8;
+  --text-muted: #8b91aa;
+  --accent: #9aa9e8;
+  --accent-strong: #c0cbf5;
+  --accent-soft: #2a335a;
+  --bubble-parent: #3a4a8a;
+  --bubble-parent-text: #f3f4ff;
+  --bubble-fabella: #1c2440;
+  --bubble-fabella-text: #e6e8f2;
+  --danger: #d18a8a;
+  --shadow: 0 1px 0 rgba(0,0,0,0.3), 0 12px 30px -22px rgba(0,0,0,0.5);
+  color-scheme: dark;
+}
+:root[data-theme="kitchen-table"] {
+  --bg: #faf3e3;
+  --bg-2: #f3e9c9;
+  --surface: #fff8e6;
+  --surface-2: #f7ecce;
+  --line: #d9c79a;
+  --line-soft: #e6d8b0;
+  --text: #3a2a18;
+  --text-soft: #574231;
+  --text-muted: #8a7556;
+  --accent: #b07a2a;
+  --accent-strong: #8a5a18;
+  --accent-soft: #f0d9a5;
+  --bubble-parent: #a86a1c;
+  --bubble-parent-text: #fff8e6;
+  --bubble-fabella: #fff8e6;
+  --bubble-fabella-text: #3a2a18;
+  --danger: #a14a2a;
+  --shadow: 0 1px 0 rgba(0,0,0,0.02), 0 12px 30px -22px rgba(120,80,20,0.22);
+  color-scheme: light;
+}
+:root[data-theme="garden"] {
+  --bg: #f1f5e8;
+  --bg-2: #e6efd4;
+  --surface: #fbfaf0;
+  --surface-2: #eef3dc;
+  --line: #cfdcb5;
+  --line-soft: #dde8c4;
+  --text: #1f2a14;
+  --text-soft: #3a4a26;
+  --text-muted: #6e7d4d;
+  --accent: #6b8a3a;
+  --accent-strong: #4a6a1c;
+  --accent-soft: #dde8c4;
+  --bubble-parent: #6b8a3a;
+  --bubble-parent-text: #fbfaf0;
+  --bubble-fabella: #fbfaf0;
+  --bubble-fabella-text: #1f2a14;
+  --danger: #a14a2a;
+  --shadow: 0 1px 0 rgba(0,0,0,0.02), 0 12px 30px -22px rgba(60,80,20,0.18);
+  color-scheme: light;
+}
+:root[data-theme="notebook"] {
+  --bg: #f6f4ee;
+  --bg-2: #ece8dd;
+  --surface: #fdfcf7;
+  --surface-2: #efece2;
+  --line: #d4cebd;
+  --line-soft: #e1ddce;
+  --text: #20242e;
+  --text-soft: #3b414c;
+  --text-muted: #6a6f7a;
+  --accent: #2a3a52;
+  --accent-strong: #1a2a42;
+  --accent-soft: #d8deeb;
+  --bubble-parent: #2a3a52;
+  --bubble-parent-text: #fdfcf7;
+  --bubble-fabella: #fdfcf7;
+  --bubble-fabella-text: #20242e;
+  --danger: #a23a3a;
+  --shadow: 0 1px 0 rgba(0,0,0,0.03), 0 12px 30px -22px rgba(20,30,50,0.18);
+  color-scheme: light;
+}
+:root[data-theme="playroom"] {
+  --bg: #fdf2f4;
+  --bg-2: #fbe5ea;
+  --surface: #ffffff;
+  --surface-2: #fdeef2;
+  --line: #f1d4dc;
+  --line-soft: #f9e3e9;
+  --text: #3a2030;
+  --text-soft: #5a3a4a;
+  --text-muted: #8a6a78;
+  --accent: #e07aa0;
+  --accent-strong: #b8507a;
+  --accent-soft: #fbd6e3;
+  --bubble-parent: #e07aa0;
+  --bubble-parent-text: #ffffff;
+  --bubble-fabella: #ffffff;
+  --bubble-fabella-text: #3a2030;
+  --danger: #c44a4a;
+  --shadow: 0 1px 0 rgba(0,0,0,0.02), 0 12px 30px -22px rgba(180,80,120,0.18);
+  color-scheme: light;
+}
+*:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 6px;
 }
 * { box-sizing: border-box; }
 html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); font-family: var(--font-sans); -webkit-font-smoothing: antialiased; }
@@ -1100,6 +1204,15 @@ a { color: var(--accent-strong); }
     <input id="child-name" type="text" maxlength="30" placeholder="leave empty to address the parent" style="width:100%; padding: 10px 12px; border:1px solid var(--line); border-radius: 10px; background: var(--bg); color: var(--text); font: 400 14px var(--font-sans);">
     <label style="display:block; font: 500 12px var(--font-mono); color: var(--text-muted); margin: 16px 0 6px; letter-spacing: 0.06em; text-transform: uppercase;">Tone</label>
     <div id="tone-row" style="display:grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px;"></div>
+    <label style="display:block; font: 500 12px var(--font-mono); color: var(--text-muted); margin: 16px 0 6px; letter-spacing: 0.06em; text-transform: uppercase;">Theme</label>
+    <select id="theme-select" style="width:100%; padding: 10px 12px; border:1px solid var(--line); border-radius: 10px; background: var(--bg); color: var(--text); font: 500 14px var(--font-sans);">
+      <option value="storybook">Storybook (default)</option>
+      <option value="bedtime">Bedtime (soft dark)</option>
+      <option value="kitchen-table">Kitchen Table (warm cream)</option>
+      <option value="garden">Garden (gentle greens)</option>
+      <option value="notebook">Notebook (paper and ink)</option>
+      <option value="playroom">Playroom (soft pastels)</option>
+    </select>
     <div style="display:flex; gap: 8px; justify-content: flex-end; margin-top: 18px;">
       <button type="button" class="btn-ghost" id="settings-cancel">Close</button>
       <button type="submit" class="btn-send" style="padding: 8px 14px;">Save</button>
@@ -1133,6 +1246,25 @@ a { color: var(--accent-strong); }
   var EXAMPLES = __EXAMPLES__;
   var SECTION_SEP = "\x1f";
   var SESSION_KEY = "fabella_session_id";
+  var THEME_KEY = "fabella-theme";
+  var THEME_ALLOW = ["storybook","bedtime","kitchen-table","garden","notebook","playroom"];
+
+  function readTheme() {
+    try {
+      var saved = localStorage.getItem(THEME_KEY);
+      return THEME_ALLOW.indexOf(saved) >= 0 ? saved : "storybook";
+    } catch (_) {
+      return "storybook";
+    }
+  }
+  function applyTheme(name) {
+    var theme = THEME_ALLOW.indexOf(name) >= 0 ? name : "storybook";
+    document.documentElement.dataset.theme = theme;
+    var sel = document.getElementById("theme-select");
+    if (sel) sel.value = theme;
+  }
+  var currentTheme = readTheme();
+  applyTheme(currentTheme);
 
   var sessionId = (function () {
     try {
@@ -1166,6 +1298,8 @@ a { color: var(--accent-strong); }
   var toneRow = document.getElementById("tone-row");
   var settingsCancel = document.getElementById("settings-cancel");
   var openSettings = document.getElementById("open-settings");
+  var themeSelect = document.getElementById("theme-select");
+  if (themeSelect) themeSelect.value = currentTheme;
 
   var currentAge = 7;
   var currentTone = "gentle";
@@ -1645,6 +1779,15 @@ a { color: var(--accent-strong); }
 
   openSettings.addEventListener("click", function () { dlg.showModal(); });
   settingsCancel.addEventListener("click", function () { dlg.close(); });
+
+  if (themeSelect) {
+    themeSelect.addEventListener("change", function () {
+      var next = THEME_ALLOW.indexOf(themeSelect.value) >= 0 ? themeSelect.value : "storybook";
+      currentTheme = next;
+      try { localStorage.setItem(THEME_KEY, next); } catch (_) {}
+      applyTheme(next);
+    });
+  }
 
   clearBtn.addEventListener("click", async function () {
     if (!confirm("Clear this conversation and long-term memory? This cannot be undone.")) return;

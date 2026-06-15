@@ -60,12 +60,13 @@ with VoxCPM2.
   JSON plus one repair retry. Cross-field consistency (`ok` ⇔ `verdict`)
   is enforced in code, not in the prompt.
 - **Three separate Modal web_servers.** Drafter and judge run on A10G
-  with `min_containers=1` while budget allows. TTS runs separately on
-  L4 with `min_containers=1` so read-aloud is also warm during demos.
+  with `min_containers=0` and a 2-minute `scaledown_window` so they scale
+  to zero when idle. TTS runs separately on L4 with the same scale-to-zero
+  policy.
 - **TTS only runs on demand.** VoxCPM2 is a separate FastAPI wrapper,
   not vLLM. The HF Space `make_audio` API posts explanation text to
   `/synthesize`, receives `audio/wav`, and returns a base64 data URL to
-  the browser. It is kept warm on L4 while budget allows.
+  the browser. It cold-starts on demand after an idle period.
 - **The judge has NO tool-calling flags on the server side.** Its
   prompt asks for raw JSON in `content`; the Pydantic parser does the
   rest. This dodges Nemotron-3-Nano's chat-template tool-dialect
@@ -183,12 +184,12 @@ The most recent session (pivot to Backyard AI) changed:
      text and produces 48 kHz audio; Gemma 4 could (if enabled)
      read audio and produce text. Don't conflate them when
      debugging.
-- **Critical-path LLMs are kept warm.** Drafter and judge use
-  `min_containers=1`, which removes most demo cold-start latency but
-  bills continuously while deployed. TTS also uses `min_containers=1` on L4
-  so **Read aloud** is responsive during demos.
+- **Critical-path LLMs scale to zero.** Drafter and judge use
+  `min_containers=0` with a 2-minute `scaledown_window`, so the first
+  generation after idle pays a Modal/vLLM cold start but the demo does not
+  bill continuously while nobody is using it. TTS follows the same policy on L4.
 - **TTS runs on L4.** VoxCPM2 is ~2B and fits smaller GPUs, so
-  `serve_tts` uses `gpu="L4"` plus `min_containers=1` instead of A10G.
+  `serve_tts` uses `gpu="L4"` plus `min_containers=0` instead of A10G.
   If L4 availability or latency is bad, switch back to A10G or try Modal
   GPU fallbacks.
 - **VoxCPM2 TTS is not vLLM.** `serve_tts` writes a generated FastAPI
@@ -242,15 +243,15 @@ hf spaces restart build-small-hackathon/Fabella
 
 ## Cost
 
-- **Drafter**: 1× A10G, $0.80/hr, 10-min scaledown
-- **Judge**: 1× A10G, $0.80/hr, 10-min scaledown
-- **TTS**: 1× L4, `min_containers=1`, only used after **Read aloud**
+- **Drafter**: 1× A10G while active, $0.80/hr, 2-minute scaledown
+- **Judge**: 1× A10G while active, $0.80/hr, 2-minute scaledown
+- **TTS**: 1× L4 while active, `min_containers=0`, only used after **Read aloud**
 - **At idle**: $0/hr (scaledown)
 - **Typical demo session**: a few minutes warm = ~$0.03-0.05
 
 ## Known Issues / Open Questions
 
-1. **Cold start latency** — First request after 10 min idle triggers
+1. **Cold start latency** — First request after 2 min idle triggers
    vLLM cold start (~2 min per container for model load + torch.compile
    + CUDA graph capture). Both containers cold-start in sequence on
    the first request of a new session. Could add `min_containers=1` to

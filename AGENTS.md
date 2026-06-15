@@ -168,12 +168,12 @@ end-to-end testing.
      text and produces 48 kHz audio; Gemma 4 could (if enabled)
      read audio and produce text. Don't conflate them when
      debugging.
-- **Critical-path LLMs are kept warm.** Drafter and judge use
-  `min_containers=1`, which removes most demo cold-start latency but
-  bills continuously while deployed. TTS also uses `min_containers=1` on L4
-  so **Read aloud** is responsive during demos.
+- **Critical-path LLMs scale to zero.** Drafter and judge use
+  `min_containers=0` with a 2-minute `scaledown_window`, so the first
+  generation after idle pays a Modal/vLLM cold start but the demo does not
+  bill continuously while nobody is using it. TTS follows the same policy on L4.
 - **TTS runs on L4.** VoxCPM2 is ~2B and fits smaller GPUs, so
-  `serve_tts` uses `gpu="L4"` plus `min_containers=1` instead of A10G.
+  `serve_tts` uses `gpu="L4"` plus `min_containers=0` instead of A10G.
   If L4 availability or latency is bad, switch back to A10G or try Modal
   GPU fallbacks.
 - **VoxCPM2 TTS is not vLLM.** `serve_tts` writes a generated FastAPI
