@@ -2,7 +2,7 @@
 
 What gets captured
 ------------------
-One JSONL row per successful (or failed) agent invocation. The row contains
+One row per successful (or failed) agent invocation. The row contains
 the full LangChain ReAct message trace (system prompt, user prompt,
 assistant tool calls, tool responses, final draft) plus the judge's
 structured verdict. This is the "Sharing is Caring" merit badge: a public,
@@ -29,19 +29,42 @@ Before anything leaves the Space, the row is run through `_anonymize()`:
 
 Opt-out
 -------
-``FABELLA_SHARE_TRACES=0`` disables capture entirely (default: on, except in
-local dev). Per-request opt-out is also supported via ``share_trace=False``
-on the ``ExplainRequest`` payload.
+``FABELLA_SHARE_TRACES=0`` disables capture entirely (this is the
+default). To re-enable the public dataset, set
+``FABELLA_SHARE_TRACES=1`` on the Space. Per-request opt-out is also
+supported via ``share_trace=False`` on the ``ExplainRequest`` payload.
 
 Publishing
 ----------
-Captured rows accumulate in an in-memory buffer, then are appended to a
-single JSONL file (``data/train-00000-of-00001.jsonl``) inside the dataset
-repo via ``huggingface_hub.HfApi().upload_file(...)``. A background daemon
-flushes the buffer every ``FLUSH_INTERVAL_S`` seconds OR when the buffer hits
-``FLUSH_BUFFER_SIZE`` rows, whichever comes first. The HF token is read from
-the ``HF_TOKEN`` env var, which HF Spaces injects automatically for the
-owning user.
+Captured rows accumulate in an in-memory buffer, then are flushed to the
+Hub via ``huggingface_hub.HfApi().create_commit(...)`` with one
+``CommitOperationAdd`` per row, each targeting a unique
+``data/<trace_id>.json`` path. A background daemon flushes the buffer every
+``FLUSH_INTERVAL_S`` seconds OR when the buffer hits ``FLUSH_BUFFER_SIZE``
+rows, whichever comes first. The HF token is read from the ``HF_TOKEN``
+env var, which HF Spaces injects automatically for the owning user.
+
+Why per-row files, not a single JSONL
+------------------------------------
+The previous version downloaded ``data/train-00000-of-00001.jsonl``,
+appended locally, and re-uploaded the whole file. That is a read-modify-write
+cycle which (a) loses rows when two Space replicas flush concurrently, and
+(b) re-uploads the full file on every push (O(n²) bandwidth as the dataset
+grows). The per-row UUID pattern is race-free across replicas (each row is
+its own commit, no shared mutable state on the Hub) and constant-cost per
+push. The dataset card's "preview" still works because ``huggingface_hub``
+lists ``data/*.json`` in the repo tree.
+
+Startup probe
+-------------
+On ``start()`` (only when capture is enabled) we call ``_probe()`` which
+atomically Add+Deletes a tiny ``data/.probe.json`` file in a single
+``create_commit`` call, to verify (a) the HF token is valid, (b) the
+token can create the dataset repo, and (c) the token can commit files
+to it. The Add+Delete happen in one commit, so a partial failure can
+never leave the probe file in the public dataset. If the probe fails we
+log a single loud ERROR with the exception class and message and
+disable capture for the lifetime of the process — no silent drops.
 """
 
 from __future__ import annotations
@@ -54,9 +77,8 @@ import sys
 import threading
 import time
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -82,18 +104,19 @@ DATASET_REPO = os.environ.get(
 FLUSH_BUFFER_SIZE = int(os.environ.get("FABELLA_TRACE_FLUSH_SIZE", "5"))
 FLUSH_INTERVAL_S = float(os.environ.get("FABELLA_TRACE_FLUSH_INTERVAL_S", "300"))
 
-# The single file the dataset is written to. JSONL, append-only. We use one
-# file rather than the HF datasets sharded convention because (a) the volume
-# is small for a hackathon demo, and (b) we want every row in one place to
-# make the dataset card's preview useful.
-DATASET_FILE = "data/train-00000-of-00001.jsonl"
+# Per-row upload path prefix. Each row lives at ``data/<trace_id>.json``,
+# keyed by the row's own UUID. This eliminates the read-modify-write race
+# that bit the old single-JSONL design when (a) the Space ran >1 replica
+# or (b) the timer-thread and size-triggered async flush interleaved.
+DATASET_DIR = "data"
+PROBE_PATH = f"{DATASET_DIR}/.probe.json"
 
-# Capture is OFF by default for the hackathon demo. The dataset was
-# removed by the maker; the only path to data now is the per-parent
-# "Download my history" self-export button (see ``app.py::
-# api_history_download``). To re-enable the public dataset for
-# re-deployment, set ``FABELLA_SHARE_TRACES=1`` on the Space and the
-# publisher will resume writing to ``Kiy-K/fabella-traces``.
+# Capture is OFF by default. The public dataset was removed by the maker
+# for this demo; the only path to data is the per-parent "Download my
+# history" self-export button in ``app.py::api_history_download``. To
+# re-enable the public dataset for re-deployment, set
+# ``FABELLA_SHARE_TRACES=1`` on the Space and the publisher will resume
+# writing to ``Kiy-K/fabella-traces``.
 SHARE_TRACES = os.environ.get("FABELLA_SHARE_TRACES", "0").lower() in (
     "1",
     "true",
@@ -328,7 +351,8 @@ class TraceRecord:
     app_version: str
     schema_version: int = 1
 
-    def to_jsonl(self) -> str:
+    def to_json(self) -> str:
+        """Render the record as a single JSON object string."""
         return json.dumps(asdict(self), ensure_ascii=False)
 
 
@@ -394,7 +418,7 @@ def build_trace_record(
 
 
 class TracePublisher:
-    """Thread-safe in-memory buffer that flushes JSONL rows to the Hub.
+    """Thread-safe in-memory buffer that flushes trace rows to the Hub.
 
     The publisher is started once at app import time. ``submit()`` is
     non-blocking (it just appends to the buffer). The background thread
@@ -402,8 +426,10 @@ class TracePublisher:
     so a burst of traffic doesn't sit in memory for the full interval.
 
     All flushes are serialized through ``_flush_lock`` so two threads can
-    never push overlapping revisions of the file. The Hub append uses
-    ``commit_message="append"`` so a single push updates the same file.
+    never push overlapping Hub revisions. Each row is uploaded as its own
+    ``data/<trace_id>.json`` file via a single ``create_commit`` per flush
+    batch, so concurrent flushes (or >1 Space replica) cannot lose rows
+    to a read-modify-write race on a shared JSONL file.
     """
 
     def __init__(self) -> None:
@@ -443,9 +469,19 @@ class TracePublisher:
                 "Set HF_TOKEN to the Space owner's write token to enable capture."
             )
             return
-        if not self._enabled:
-            return
         if self._thread is not None and self._thread.is_alive():
+            return
+        # Ensure the dataset repo exists, then run a write+delete probe so a
+        # misconfigured Space (bad token, read-only token, no create rights)
+        # fails LOUDLY at import time instead of silently dropping rows for
+        # hours. If either step fails we disable capture for the lifetime of
+        # the process; the per-parent self-export path in app.py keeps
+        # working regardless.
+        if not self._ensure_repo():
+            self._enabled = False
+            return
+        if not self._probe():
+            self._enabled = False
             return
         self._stop.clear()
         self._thread = threading.Thread(
@@ -527,60 +563,144 @@ class TracePublisher:
                         f"'{DATASET_REPO}'.",
                     )
 
-    def _push_to_hub(self, rows: list[TraceRecord]) -> None:
+    def _commit(self, operations, message, description=None) -> None:
+        """Single-call wrapper around ``HfApi.create_commit`` for the dataset repo.
+
+        All Hub writes from the publisher go through this helper so the
+        ``commit_message`` / ``commit_description`` format and the
+        ``repo_id`` / ``repo_type`` kwargs stay consistent across the
+        per-row flush and the startup probe. If we ever need to add
+        e.g. ``revision`` or a custom user-agent, we change one place.
+        """
         from huggingface_hub import HfApi
 
-        api = HfApi(token=self._hf_token)
-        new_lines = "\n".join(r.to_jsonl() for r in rows) + "\n"
+        kwargs = {"commit_description": description} if description else {}
+        HfApi(token=self._hf_token).create_commit(
+            repo_id=DATASET_REPO,
+            repo_type="dataset",
+            operations=list(operations),
+            commit_message=message,
+            **kwargs,
+        )
 
-        # The dataset repo may not exist on the first ever push (the
-        # Space's HF_TOKEN may or may not have rights to create repos
-        # in the build-small-hackathon org; if it does, ``create_repo``
-        # is idempotent). Calling it lazily means we don't need a
-        # separate one-time setup step.
+    def _push_to_hub(self, rows: list[TraceRecord]) -> None:
+        """Upload a batch of rows as one commit with one operation per row.
+
+        Each row is its own ``data/<trace_id>.json`` file, so the upload is
+        race-free across Space replicas and across the timer-thread vs.
+        size-triggered async flush within one process. One ``create_commit``
+        call wraps the whole batch as a single commit on the Hub, so the
+        git history is one commit per flush (not one per row).
+        """
+        from huggingface_hub import CommitOperationAdd
+
+        operations = [
+            CommitOperationAdd(
+                path_in_repo=f"{DATASET_DIR}/{r.trace_id}.json",
+                path_or_fileobj=r.to_json().encode("utf-8"),
+            )
+            for r in rows
+        ]
+        self._commit(
+            operations,
+            message=f"append {len(rows)} fabella trace row(s)",
+            description=(
+                f"Append {len(rows)} anonymized Fabella trace row(s). "
+                f"Schema: fabella.trace.v1. No raw situation, no child name."
+            ),
+        )
+
+    def _ensure_repo(self) -> bool:
+        """Create the dataset repo if it doesn't exist. Return True on success.
+
+        A 401/403 here means the Space's ``HF_TOKEN`` doesn't have
+        ``repo.create`` rights in the target namespace (e.g. it can read
+        ``Kiy-K/fabella-traces`` but not create it). In that case the
+        Space owner must pre-create the dataset and grant the token write
+        access, OR override ``FABELLA_TRACE_REPO`` to a namespace where
+        the token can create. We return ``False`` so the caller can
+        disable capture loudly instead of failing every flush.
+        """
+        from huggingface_hub import HfApi
+
         try:
-            api.create_repo(
+            HfApi(token=self._hf_token).create_repo(
                 repo_id=DATASET_REPO,
                 repo_type="dataset",
                 exist_ok=True,
                 private=False,
             )
+            return True
         except Exception as e:
-            # 403/401 here means the token has read-only access to the
-            # org. The Space owner can pre-create the repo via the
-            # ``huggingface-cli repo create`` command. We still try
-            # the upload below so a pre-existing dataset still works.
-            log.warning(
-                f"[traces] could not ensure {DATASET_REPO} exists: "
+            log.error(
+                f"[traces] cannot create or access dataset repo "
+                f"'{DATASET_REPO}': {type(e).__name__}: {e}. "
+                f"Pre-create the dataset on the Hub and grant the Space's "
+                f"HF_TOKEN write access, or set FABELLA_TRACE_REPO to a "
+                f"namespace where the token can create repos. "
+                f"Trace capture DISABLED for this process."
+            )
+            return False
+
+    def _probe(self) -> bool:
+        """One-shot write+delete in a single atomic commit to verify Hub access.
+
+        Catches (a) bad token, (b) missing repo-create rights, (c) missing
+        repo-write rights — all at import time, so a misconfigured Space
+        doesn't silently drop rows for hours before anyone notices.
+
+        The Add and Delete of ``PROBE_PATH`` are bundled into a single
+        ``create_commit`` call so the probe is atomic on the Hub: either
+        the commit succeeds (probe is added then removed in one revision)
+        or it fails (probe is never created). There is no intermediate
+        state where a sentinel file sits in the public dataset.
+        Returns True if the round-trip succeeded.
+        """
+        from huggingface_hub import CommitOperationAdd, CommitOperationDelete
+        import warnings
+
+        payload = json.dumps(
+            {
+                "probe": True,
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "pid": os.getpid(),
+            }
+        ).encode("utf-8")
+        try:
+            # The ``huggingface_hub`` SDK emits a ``UserWarning`` when an
+            # Add and a Delete target the same path in one commit. We
+            # intentionally rely on this pattern (atomic probe), so
+            # silence just this warning around the call. The commit
+            # itself still executes correctly.
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message="About to delete a file that have just been updated",
+                    category=UserWarning,
+                )
+                self._commit(
+                    [
+                        CommitOperationAdd(
+                            path_in_repo=PROBE_PATH,
+                            path_or_fileobj=payload,
+                        ),
+                        CommitOperationDelete(path_in_repo=PROBE_PATH),
+                    ],
+                    message="fabella trace publisher startup probe",
+                    description=(
+                        "Atomic Add+Delete of .probe.json to verify the HF_TOKEN "
+                        "can commit to the dataset repo. The probe file is never "
+                        "left in the repo on success."
+                    ),
+                )
+            log.info(f"[traces] probe OK against {DATASET_REPO}")
+            return True
+        except Exception as e:
+            log.error(
+                f"[traces] probe FAILED against {DATASET_REPO}: "
                 f"{type(e).__name__}: {e}"
             )
-
-        existing = ""
-        try:
-            existing = api.hf_hub_download(
-                repo_id=DATASET_REPO,
-                filename=DATASET_FILE,
-                repo_type="dataset",
-                force_download=False,
-            )
-            existing_path = Path(existing)
-            if existing_path.exists():
-                existing = existing_path.read_text(encoding="utf-8")
-                if existing and not existing.endswith("\n"):
-                    existing += "\n"
-        except Exception:
-            # First push, missing file, or read-permission issue. Treating
-            # as empty lets the upload proceed so a write-protected read
-            # does not silently disable capture.
-            existing = ""
-
-        api.upload_file(
-            path_or_fileobj=(existing + new_lines).encode("utf-8"),
-            path_in_repo=DATASET_FILE,
-            repo_id=DATASET_REPO,
-            repo_type="dataset",
-            commit_message=f"append {len(rows)} trace row(s)",
-        )
+            return False
 
 
 # Module-level singleton. Imported by app.py; ``start()`` is called once at

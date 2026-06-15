@@ -16,7 +16,7 @@ When the public publisher is enabled, the dataset captures the full ReAct loop f
 - **Override env var:** `FABELLA_TRACE_REPO=build-small-hackathon/fabella-traces` (only works if an org admin pre-creates the dataset there — the Space's HF_TOKEN is contributor-level and cannot create org-namespace repos)
 - **Currently:** disabled by default for this demo; data lives in the per-parent bucket and is exportable via the Space's **Settings → Download my history** button.
 
-The dataset repo is created on first publish by `trace.py` via `HfApi.create_repo(exist_ok=True)`, so a fresh deployment does not require a one-time setup step.
+The dataset repo is created on first publish by `trace.py::_ensure_repo` via `HfApi.create_repo(exist_ok=True)`, so a fresh deployment does not require a one-time setup step.
 
 ## Schema (one row per request, when publishing is enabled)
 
