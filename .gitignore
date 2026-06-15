@@ -2,7 +2,38 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .venv/
+venv/
 .env
+.env.*
 .gradio/
 *.log
 .DS_Store
+
+# Local agent / IDE / index working artifacts (not part of the submission)
+.agents/
+.codegraph/
+.codex/
+chrome-headless-shell/
+kilo.jsonc
+opencode.json
+.kilocodeignore
+skills-lock.json
+
+# HyperFrames / video render scratch (not part of the submission)
+video/
+
+# Generic build / cache / large-binary scrub
+.cache/
+dist/
+build/
+outputs/
+exports/
+scratch/
+.local-notes/
+*.pdf
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.key
+*.pem

@@ -94,7 +94,7 @@ end-to-end testing.
 - `safety.py` — input sanitization (`sanitize_situation`, `sanitize_name`, `has_profanity`), `explain_to_words(tone)`, `age_bucket(age)`.
 - `llm.py` — `FabellaVLLM`, a `BaseChatModel` subclass wrapping vLLM's OpenAI-compatible API. `bind_tools` builds an OpenAI-spec `tools=[...]` payload, `_generate` passes it on the request and reads `response.choices[0].message.tool_calls` from the response. Replay of prior `AIMessage.tool_calls` and `ToolMessage` results into next-turn messages uses the OpenAI chat-completions shape.
 - `modal_app.py` — Modal deployment. `download_drafter`, `download_judge`, and `download_tts` write weights to the `fabella-models` Volume. `serve_drafter` runs vLLM with `--language-model-only --enable-auto-tool-choice --tool-call-parser gemma4` on port 8000 (A10G). `serve_judge` runs vLLM with no tool-calling flags on port 8001 (A10G). `serve_tts` runs a tiny VoxCPM2 FastAPI app on port 8002 (L4). One Modal app, three web_server functions.
-- `modal_app_gemma.py` — Legacy single-model Modal deploy from the previous session. Not the live deploy. Reference only.
+- `modal_app_gemma.py` — (removed) Legacy single-model Modal deploy from the previous session. Not the live deploy. Reference only.
 
 ## Non-obvious gotchas
 

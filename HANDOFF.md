@@ -95,7 +95,7 @@ with VoxCPM2.
 | `safety.py` | Input sanitization, profanity block, `sanitize_situation`, `explain_to_words(tone)`, `age_bucket(age)`. |
 | `llm.py` | `FabellaVLLM` BaseChatModel wrapping vLLM's OpenAI-compatible API. `bind_tools` builds OpenAI-spec `tools=[...]`, `_generate` passes it and reads `message.tool_calls` from the response. Replay of prior `AIMessage.tool_calls` and `ToolMessage` results into next-turn messages uses the OpenAI chat-completions shape. |
 | `modal_app.py` | Modal deployment: `download_drafter` + `download_judge` + `download_tts`; `serve_drafter` (port 8000), `serve_judge` (port 8001), `serve_tts` (port 8002). Drafter/judge on A10G; TTS on L4. |
-| `modal_app_gemma.py` | Legacy: a previous-session single-model Modal deploy, kept for reference. Not the live deploy. |
+| `modal_app_gemma.py` | (removed) Legacy: a previous-session single-model Modal deploy, kept for reference. Not the live deploy. |
 
 ## What Changed This Session
 
@@ -103,7 +103,7 @@ The most recent session (pivot to Backyard AI) changed:
 
 ### New files
 - `judge.py` — Pydantic-validated judge with repair retry
-- `modal_app_gemma.py` — kept as reference for the prior single-model deploy
+- `modal_app_gemma.py` — (removed) kept as reference for the prior single-model deploy
 
 ### Substantially rewritten
 - `agent.py` — story-generation agent replaced with explanation-generation agent. `make_validate_tool` now optionally takes `judge_llm` and routes through `judge_explanation()`. The drafter's output format changed from "Title: / body" to "Opener: / Body: / Closer: / (optional) If they ask more:". `extract_explanation` parses these four sections.
