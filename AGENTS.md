@@ -225,6 +225,8 @@ hf spaces variables add build-small-hackathon/Fabella \
     --env MODAL_JUDGE_URL=https://khoitruong071510--fabella-serve-judge.modal.run
 hf spaces variables add build-small-hackathon/Fabella \
     --env MODAL_TTS_URL=https://khoitruong071510--fabella-serve-tts.modal.run
+hf spaces variables add build-small-hackathon/Fabella \
+    --env MODAL_ASR_URL=https://khoitruong071510--fabella-asr-experiment-serve-asr.modal.run
 
 # HF Space: upload code
 hf upload build-small-hackathon/Fabella app.py    --type space

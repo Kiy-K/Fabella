@@ -5,7 +5,7 @@ judge) or L4 (TTS):
 
   serve_drafter (port 8000) — Gemma 4 E4B-IT (4B). Generates explanations.
   serve_judge   (port 8001) — Nemotron-3 Nano 4B. Scores the draft against
-                                the request and returns a structured verdict.
+                                 the request and returns a structured verdict.
   serve_tts     (port 8002) — VoxCPM2. Synthesizes read-aloud WAV audio.
 
 The judge runs after the drafter; if the verdict is "revise", the
@@ -38,11 +38,10 @@ The most effective mitigations, in order:
   2. **Skip CUDA-graph capture** with ``--enforce-eager`` for the demo.
      Drops cold start by ~20–40s. Trades a small amount of throughput
      for much faster first-token.
-  3. **Smaller judge** is not the lever here — the bottleneck is
-     vLLM's import + compile, not 4B vs 7B.
-  4. **Space-side warmup ping** on Space startup keeps the first parent
-     request warm (see ``app.py`` ``/health`` pattern). The cold
-     request still happens — just not in front of a parent.
+  3. **No Space-side warmup ping**. A warmup ping makes the first click
+     feel better, but every Space restart would pay for an A10G cold
+     start whether or not a parent ever arrives. For budget safety, only
+     a real parent action wakes Modal.
 
 Volume layout
 -------------
@@ -121,12 +120,13 @@ tts_image = (
 )
 
 
+
+
 # --- Model download (one entry per model) --------------------------------
 
 
-@app.function(image=download_image, volumes={MODEL_PATH: model_volume}, timeout=60 * 60)
-def download_drafter(force: bool = False):
-    """Pull Gemma 4 E4B-IT weights to the Volume (run once)."""
+def _download_drafter(force: bool = False):
+    """Pull Gemma 4 E4B-IT weights to the Volume/image layer."""
     from huggingface_hub import snapshot_download
     target = Path(MODEL_PATH) / DRAFTER_DIR
     if target.exists() and any(target.iterdir()) and not force:
@@ -148,8 +148,13 @@ def download_drafter(force: bool = False):
 
 
 @app.function(image=download_image, volumes={MODEL_PATH: model_volume}, timeout=60 * 60)
-def download_judge(force: bool = False):
-    """Pull Nemotron-Nano-9B-v2 weights to the Volume (run once)."""
+def download_drafter(force: bool = False):
+    """Pull Gemma 4 E4B-IT weights to the Volume (run once)."""
+    return _download_drafter(force=force)
+
+
+def _download_judge(force: bool = False):
+    """Pull Nemotron-Nano-4B weights to the Volume/image layer."""
     from huggingface_hub import snapshot_download
     target = Path(MODEL_PATH) / JUDGE_DIR
     if target.exists() and any(target.iterdir()) and not force:
@@ -168,6 +173,12 @@ def download_judge(force: bool = False):
     )
     model_volume.commit()
     print("Judge download complete")
+
+
+@app.function(image=download_image, volumes={MODEL_PATH: model_volume}, timeout=60 * 60)
+def download_judge(force: bool = False):
+    """Pull Nemotron-Nano-4B weights to the Volume (run once)."""
+    return _download_judge(force=force)
 
 
 # --- vLLM servers --------------------------------------------------------
@@ -265,7 +276,7 @@ vllm_drafter_image = (
     vllm_image
     .env(VLLM_RUNTIME_ENV)
     .run_function(
-        download_drafter,
+        _download_drafter,
         volumes={MODEL_PATH: model_volume},
         force_build=False,
     )
@@ -277,7 +288,7 @@ vllm_judge_image = (
     vllm_image
     .env(VLLM_RUNTIME_ENV)
     .run_function(
-        download_judge,
+        _download_judge,
         volumes={MODEL_PATH: model_volume},
         force_build=False,
     )
@@ -428,9 +439,8 @@ async def synthesize(payload: dict):
 '''
 
 
-@app.function(image=download_image, volumes={MODEL_PATH: model_volume}, timeout=60 * 60)
-def download_tts(force: bool = False):
-    """Pull VoxCPM2 weights to the Volume (run once)."""
+def _download_tts(force: bool = False):
+    """Pull VoxCPM2 weights to the Volume/image layer."""
     from huggingface_hub import snapshot_download
     target = Path(MODEL_PATH) / TTS_DIR
     if target.exists() and any(target.iterdir()) and not force:
@@ -454,11 +464,17 @@ def download_tts(force: bool = False):
     print("TTS download complete")
 
 
+@app.function(image=download_image, volumes={MODEL_PATH: model_volume}, timeout=60 * 60)
+def download_tts(force: bool = False):
+    """Pull VoxCPM2 weights to the Volume (run once)."""
+    return _download_tts(force=force)
+
+
 # Bake VoxCPM2 weights into the TTS image so cold start only has to
 # load them to VRAM (~5-10s), not download from the Volume (~10-20s).
 # Defined after ``download_tts`` so the forward reference resolves.
 tts_image_baked = tts_image.run_function(
-    download_tts,
+    _download_tts,
     volumes={MODEL_PATH: model_volume},
     force_build=False,
 )

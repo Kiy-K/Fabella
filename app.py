@@ -78,6 +78,10 @@ MODAL_TTS_URL = os.environ.get(
     "MODAL_TTS_URL",
     "https://khoitruong071510--fabella-serve-tts.modal.run",
 )
+MODAL_ASR_URL = os.environ.get(
+    "MODAL_ASR_URL",
+    "https://khoitruong071510--fabella-asr-experiment-serve-asr.modal.run",
+)
 
 # HF Spaces bucket mount. The current Space has a writable bucket mounted at
 # /models. We avoid a separate database cloud API by storing one minimal JSON
@@ -463,6 +467,61 @@ def make_audio(text: str, tone: str, opener: str = "", body: str = "", closer: s
     """
     return _make_audio_sync(text, tone, opener, body, closer, followup)
 
+
+def _validate_audio_data_url(data_url: str) -> None:
+    if not data_url.startswith("data:audio/") or "," not in data_url:
+        raise ValueError("Expected a browser audio recording data URL.")
+    header, payload = data_url.split(",", 1)
+    if ";base64" not in header:
+        raise ValueError("Audio recording must be base64 encoded.")
+    # Validate and cap size before proxying. Browser MediaRecorder output is
+    # compact; 8 MB is plenty for a short parent voice note.
+    audio = base64.b64decode(payload, validate=True)
+    if len(audio) > 8 * 1024 * 1024:
+        raise ValueError("Voice note is too large. Please keep it under about 30 seconds.")
+    if len(audio) < 256:
+        raise ValueError("Voice note was empty.")
+
+
+def _transcribe_audio_sync(data_url: str, target_lang: str = "en-US") -> str:
+    clean_lang = (target_lang or "en-US").strip()
+    if clean_lang != "auto" and not re.match(r"^[a-z]{2}-[A-Z]{2}$", clean_lang):
+        clean_lang = "en-US"
+    try:
+        _validate_audio_data_url(data_url)
+    except Exception as e:
+        return f"ERROR: {e}"
+    payload = json.dumps({"audio_data_url": data_url, "target_lang": clean_lang}).encode("utf-8")
+    req = urllib.request.Request(
+        MODAL_ASR_URL.rstrip("/") + "/transcribe",
+        data=payload,
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=600) as res:
+            body = json.loads(res.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="replace")[:300]
+        print(f"[asr] modal HTTP error: {e.code}: {detail}", flush=True)
+        return f"ERROR: Voice transcription failed: HTTP {e.code}"
+    except Exception as e:
+        print(f"[asr] modal error: {type(e).__name__}: {e}", flush=True)
+        return f"ERROR: Voice transcription failed: {type(e).__name__}: {e}"
+    if not body.get("ok"):
+        return f"ERROR: Voice transcription failed: {body.get('error') or 'unknown error'}"
+    text = str(body.get("text") or "").strip()
+    return text or "ERROR: Nemotron ASR returned an empty transcript."
+
+
+@app.api(name="transcribe_audio")
+def transcribe_audio(data_url: str, target_lang: str = "en-US") -> str:
+    """Transcribe a short browser-recorded voice note via Modal T4 ASR.
+
+    The ASR runtime is deliberately isolated in ``modal_asr_app.py`` so NeMo,
+    ffmpeg, and CUDA dependencies cannot break the HF Space build.
+    """
+    return _transcribe_audio_sync(data_url, target_lang)
 
 
 @app.get("/api/me")
@@ -929,6 +988,19 @@ a { color: var(--accent-strong); }
 }
 .composer textarea::placeholder { color: var(--text-muted); }
 .composer-controls { display: flex; align-items: center; gap: 8px; }
+.btn-record {
+  border: 1px solid var(--line);
+  background: var(--bg);
+  color: var(--text-soft);
+  border-radius: 999px;
+  padding: 10px 12px;
+  font: 600 13px var(--font-sans);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.btn-record:hover:not([disabled]) { border-color: var(--accent); color: var(--accent-strong); }
+.btn-record.is-recording { border-color: var(--danger); color: var(--danger); background: color-mix(in srgb, var(--danger) 8%, var(--surface)); }
+.btn-record[disabled] { opacity: 0.55; cursor: not-allowed; }
 .btn-send {
   border: 0;
   background: var(--accent);
@@ -948,7 +1020,14 @@ a { color: var(--accent-strong); }
   text-align: center;
   margin-top: 8px;
 }
-
+.asr-status {
+  max-width: 760px;
+  margin: 6px auto 0;
+  font: 500 11px var(--font-mono);
+  color: var(--text-muted);
+  letter-spacing: 0.04em;
+  text-align: left;
+}
 .typing {
   display: inline-flex; align-items: center; gap: 6px;
   font: 500 13px var(--font-sans); color: var(--text-muted);
@@ -1002,10 +1081,12 @@ a { color: var(--accent-strong); }
   <form id="composer" class="composer-inner" novalidate>
     <textarea id="input" rows="1" placeholder="Describe the hard situation. A sentence or two is enough." maxlength="800" required></textarea>
     <div class="composer-controls">
+      <button type="button" class="btn-record" id="record-btn" title="Record a short voice note">Record</button>
       <button type="submit" class="btn-send" id="send-btn"><span id="send-label">Draft</span><span aria-hidden="true">&rarr;</span></button>
     </div>
   </form>
-  <div class="composer-hint">Fabella checks every draft against a six-criterion rubric. Read-aloud uses VoxCPM2 on demand.</div>
+  <div class="asr-status" id="asr-status"></div>
+  <div class="composer-hint">Fabella checks every draft against a six-criterion rubric. Record uses Nemotron 3.5 ASR on demand.</div>
 </section>
 
 <dialog id="settings" style="border:1px solid var(--line); border-radius: var(--radius); padding: 0; max-width: 480px; width: calc(100% - 32px); background: var(--surface); color: var(--text);">
@@ -1067,6 +1148,8 @@ a { color: var(--accent-strong); }
 
   var thread = document.getElementById("thread");
   var input = document.getElementById("input");
+  var recordBtn = document.getElementById("record-btn");
+  var asrStatus = document.getElementById("asr-status");
   var sendBtn = document.getElementById("send-btn");
   var sendLabel = document.getElementById("send-label");
   var ageChip = document.getElementById("age-chip");
@@ -1086,6 +1169,9 @@ a { color: var(--accent-strong); }
   var currentAge = 7;
   var currentTone = "gentle";
   var childNameValue = "";
+  var mediaRecorder = null;
+  var recordTimer = null;
+  var recordChunks = [];
 
   function escapeHTML(s) {
     return String(s).replace(/[&<>"']/g, function (c) { return ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[c]; });
@@ -1270,7 +1356,84 @@ a { color: var(--accent-strong); }
   function setBusy(busy) {
     sendBtn.disabled = busy;
     input.disabled = busy;
+    if (recordBtn && !recordBtn.classList.contains("is-recording")) recordBtn.disabled = busy;
     sendLabel.textContent = busy ? "Drafting..." : "Draft";
+  }
+
+  function setAsrStatus(text) {
+    if (asrStatus) asrStatus.textContent = text || "";
+  }
+
+  function blobToDataUrl(blob) {
+    return new Promise(function (resolve, reject) {
+      var reader = new FileReader();
+      reader.onload = function () { resolve(String(reader.result || "")); };
+      reader.onerror = function () { reject(reader.error || new Error("Could not read recording")); };
+      reader.readAsDataURL(blob);
+    });
+  }
+
+  async function transcribeBlob(blob) {
+    setAsrStatus("Transcribing with Nemotron 3.5 ASR. First run can take a minute...");
+    var dataUrl = await blobToDataUrl(blob);
+    var text = await readGradioString("transcribe_audio", [dataUrl, "en-US"]);
+    if (text.startsWith("ERROR:")) throw new Error(text.slice(6).trim());
+    input.value = text;
+    autosize();
+    input.focus();
+    setAsrStatus("Transcript inserted. Edit it before drafting if needed.");
+  }
+
+  async function startRecording() {
+    if (!navigator.mediaDevices || !window.MediaRecorder) {
+      setAsrStatus("This browser does not support voice recording.");
+      return;
+    }
+    try {
+      var stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      recordChunks = [];
+      var recorderOptions = MediaRecorder.isTypeSupported("audio/webm") ? { mimeType: "audio/webm" } : undefined;
+      mediaRecorder = new MediaRecorder(stream, recorderOptions);
+      mediaRecorder.ondataavailable = function (event) {
+        if (event.data && event.data.size > 0) recordChunks.push(event.data);
+      };
+      mediaRecorder.onstop = async function () {
+        stream.getTracks().forEach(function (track) { track.stop(); });
+        recordBtn.classList.remove("is-recording");
+        recordBtn.textContent = "Record";
+        recordBtn.disabled = true;
+        clearTimeout(recordTimer);
+        try {
+          var blob = new Blob(recordChunks, { type: mediaRecorder.mimeType || "audio/webm" });
+          await transcribeBlob(blob);
+        } catch (err) {
+          setAsrStatus(String(err.message || err));
+        } finally {
+          recordBtn.disabled = false;
+          mediaRecorder = null;
+        }
+      };
+      mediaRecorder.start();
+      recordBtn.classList.add("is-recording");
+      recordBtn.textContent = "Stop";
+      setAsrStatus("Recording. Keep it short; auto-stops at 30 seconds.");
+      recordTimer = setTimeout(function () {
+        if (mediaRecorder && mediaRecorder.state === "recording") mediaRecorder.stop();
+      }, 30000);
+    } catch (err) {
+      setAsrStatus("Microphone unavailable: " + String(err.message || err));
+    }
+  }
+
+  if (recordBtn) {
+    recordBtn.addEventListener("click", function () {
+      if (mediaRecorder && mediaRecorder.state === "recording") {
+        setAsrStatus("Preparing transcript...");
+        mediaRecorder.stop();
+        return;
+      }
+      startRecording();
+    });
   }
 
   function _extractSseText(obj) {
